@@ -1,6 +1,8 @@
 # Wallabump
 
-Twice week (Wed + Sat, 10:00), toggle one char in every active Wallapop listing so items resurface in feeds. Emails receipt after every run.
+Twice week (Wed + Sat, 10:00), toggle one char in every active listing so items resurface in feeds. Emails receipt after every run.
+
+Sites are config, not code. `sites.toml` holds one section per marketplace — catalogue URL, edit URL, link shape, button words. Adding a second marketplace is a config entry.
 
 No LLM, no API key, no cloud. One dependency (`playwright`), driving your real Chrome from your machine at human pace.
 
@@ -26,9 +28,12 @@ No LLM, no API key, no cloud. One dependency (`playwright`), driving your real C
 | `bump.py login` | Open Chrome, sign in, confirm session. Once, and after `RE-AUTH NEEDED`. |
 | `bump.py run` | Dry run. Reads everything, changes nothing. |
 | `bump.py run --publish` | The real thing. What launchd runs. |
-| `bump.py run --publish --limit 1` | Real, one listing. Smoke test. |
+| `bump.py run --publish --limit 1` | Real, one listing per site. Smoke test. |
+| `bump.py run --site vinted` | One site instead of all. |
 | `bump.py probe` | Dump catalog HTML when selectors break. |
 | `-v` | Debug logging on any of the above. |
+
+`--site` takes any section name from `sites.toml`, or `all`, the default. An unknown name exits 2 and lists what is configured.
 
 All take the venv interpreter: `.venv/bin/python bump.py …`
 
@@ -36,15 +41,19 @@ All take the venv interpreter: `.venv/bin/python bump.py …`
 
 ## How it works
 
-1. **Attach.** Checks `127.0.0.1:9222`. Dead → launches plain Chrome on the saved profile, waits up to 15s.
-2. **Stay awake.** Spawns `caffeinate -i` for the run's lifetime. A full catalog takes ~25 min and idle sleep kills the connection.
-3. **Collect.** Scrapes the live catalog page for `/item/` links. Reserved and sold are marked skipped.
-4. **Toggle.** Per listing: open edit form, read description, flip trailing period, save.
-5. **Verify.** Reopens the form and compares. Mismatch → `unverified`.
-6. **Pace.** Sleeps 20 to 90s between listings, random.
-7. **Report.** Emails every line, exits 0 (clean), 1 (some failures), or 2 (fatal).
+1. **Load config.** Reads `sites.toml`. A missing key names the site and the key, and exits 2 rather than running half-configured.
+2. **Attach.** Checks `127.0.0.1:9222`. Dead → launches plain Chrome on the saved profile, waits up to 15s.
+3. **Stay awake.** Spawns `caffeinate -i` for the run's lifetime. A full catalog takes ~25 min per site and idle sleep kills the connection.
+4. **Per site, in order:** collect, toggle, verify.
+5. **Collect.** Scrapes the live catalogue for that site's link pattern. Reserved and sold are marked skipped.
+6. **Toggle.** Per listing: open edit form, read description, flip trailing period, save.
+7. **Verify.** Reopens the form and compares. Mismatch → `unverified`.
+8. **Pace.** Sleeps 20 to 90s between listings, random.
+9. **Report.** One email covering every site, exits 0 (clean), 1 (some failures), or 2 (fatal).
 
-**No state file.** Every run reads what is actually there and decides fresh. So a new Wallapop listing is included automatically, a half-finished run self-heals on the next one, and a failed listing is retried like any other. Nothing tracks "which ones failed last time" because nothing needs to.
+**One site failing does not stop the others.** A site that will not load, or whose session expired, records its own `failed` line and the run moves to the next. Only a dead browser aborts everything.
+
+**No state file.** Every run reads what is actually there and decides fresh. So a new listing is included automatically, a half-finished run self-heals on the next one, and a failed listing is retried like any other. Nothing tracks "which ones failed last time" because nothing needs to.
 
 **Connection loss aborts.** If Chrome dies mid-run, the run stops and emails one fatal line rather than 12 identical `TargetClosedError` failures.
 
@@ -78,7 +87,7 @@ No `playwright install` needed: script attaches to Google Chrome already in `/Ap
 
 ### 2. Gmail credentials in the Keychain
 
-One entry holds both address and app password:
+One entry holds both address and app password, shared by every site:
 
 ```bash
 security add-generic-password -a you@gmail.com -s wallabump-gmail -w
@@ -94,7 +103,7 @@ Nothing else stores a credential. No secret ever lands in the repo.
 .venv/bin/python bump.py login
 ```
 
-Opens real Chrome (not automated) on profile at `~/.wallapop-bump/chrome-profile/`, mode 700. Sign in normally — Google account, SMS/email code, whatever asks. Once listings visible, back to terminal and press Enter; confirms session over CDP.
+Opens real Chrome (not automated) on profile at `~/.wallapop-bump/chrome-profile/`, mode 700. Sign in to **every** site in `sites.toml` — one profile carries all sessions. Back to terminal, press Enter; it checks each site and names any still signed out.
 
 Can close that Chrome after. Runs relaunch as needed.
 
@@ -164,10 +173,12 @@ Wallabump: 12 ok, 1 skipped, 0 unverified, 0 failed
 Body says what each listing actually got:
 
 ```text
-ok          camiseta-fcb-mujer-nike-azul-roja  — added '.' → …'en las fotos.'
-ok          lote-ropa-nina-5-prendas           — removed '.' → …'ver última foto'
-skipped     lote-ropa-variada                  — description unsafe to toggle
+wallapop  ok          camiseta-fcb-mujer-nike-azul-roja  — added '.' → …'en las fotos.'
+wallapop  ok          lote-ropa-nina-5-prendas           — removed '.' → …'ver última foto'
+vinted    skipped     jersey-lana-talla-m                — description unsafe to toggle
 ```
+
+First column is the site.
 
 Direction alternates run to run. Both directions bump the listing equally — an edit is an edit.
 
@@ -190,7 +201,9 @@ Direction alternates run to run. Both directions bump the listing equally — an
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | No email at all | Run never fired. Mac asleep, or agent not loaded. | `launchctl list \| grep wallabump`, check `~/.wallapop-bump/bump.log`. |
-| `RE-AUTH NEEDED` | Wallapop session in saved profile expired. | `bump.py login` again. |
+| `RE-AUTH NEEDED` in subject | One site's session in the saved profile expired. Body says which. | `bump.py login` again. |
+| `Unknown site 'x'` | Typo in `--site`, or the section is still commented out in `sites.toml`. | Use a name the error lists. |
+| `Site 'x' is missing: …` | `sites.toml` section is incomplete. | Add the named keys. |
 | Every item `failed` | Wallapop redesigned; selectors stale. | Run `probe`, see below. Budget ~15 min. |
 | Run hangs at startup, no log | macOS privacy dialog waiting offscreen. | Find the dialog, click Allow. Once only. |
 | `Browser connection lost mid-run` | Chrome died or Mac slept. | Re-run. `caffeinate` should prevent the sleep case. |
@@ -202,7 +215,7 @@ Direction alternates run to run. Both directions bump the listing equally — an
 .venv/bin/python bump.py probe
 ```
 
-Attaches to running Chrome, dumps `~/.wallapop-bump/probe.html`, reports how many `/item/` links it sees. Fix constants at top of `bump.py` (`CATALOG_URL`, `EDIT_URL`, `EDIT_CONTROL`, `SAVE_CONTROL`) against dump. Expect once or twice year.
+Attaches to running Chrome, dumps `~/.wallapop-bump/probe-<site>.html` per site, reports how many listing links each shows. Fix that site's section in `sites.toml` against the dump — no code change. Expect once or twice year per site.
 
 ---
 
@@ -217,25 +230,26 @@ Descriptions it refuses to touch, to avoid publishing visible garbage:
 - ending in other punctuation (`?`, `!`, `,`, `:`) — `"Te interesa?."` wrong
 - already at field `maxlength`
 
-To switch to word pair instead (e.g. two alternating closing sentences), change `MARKER` at top of `bump.py`. Nothing else moves — `toggle()` and `describe()` both read it.
+To switch to word pair instead (e.g. two alternating closing sentences), change `MARKER` at top of `bump.py`. Nothing else moves — `toggle()` and `describe()` both read it. The marker is deliberately global: one toggle rule, tested once, applied everywhere.
 
 ---
 
 ## Development
 
 ```bash
-.venv/bin/python -m pytest -x          # toggle() and describe() edge cases
+.venv/bin/python -m pytest -x          # pure logic and config loading
 .venv/bin/ruff format . && .venv/bin/ruff check . --fix
 .venv/bin/mypy bump.py test_bump.py --strict
 ```
 
-`toggle()` and `describe()` are the only pure functions and the only things tested. Rest is browser I/O, verified by dry run.
+`toggle()`, `describe()` and the `Site` config layer are the pure parts and the only things tested. Rest is browser I/O, verified by dry run.
 
 ### Layout
 
 | File | Holds |
 | --- | --- |
-| `bump.py` | Everything. Config constants at top, pure logic, then browser I/O. |
-| `test_bump.py` | Edge cases for the two pure functions. |
+| `bump.py` | Everything. Shared constants at top, pure logic, then browser I/O. |
+| `sites.toml` | Per-site URLs and selectors. Edit this when a site redesigns. |
+| `test_bump.py` | Edge cases for the pure functions and the config loader. |
 | `com.enrigle.wallabump.plist` | launchd schedule. Copy to `~/Library/LaunchAgents/`. |
 | `~/.wallapop-bump/` | Chrome profile, log, probe dump. Never in the repo. |

@@ -1,10 +1,12 @@
-"""Edge-case tests for the only piece of pure logic in wallabump."""
+"""Edge-case tests for the pure logic in wallabump."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from bump import MARKER, describe, toggle
+from bump import MARKER, Site, describe, load_sites, toggle
 
 
 @pytest.mark.parametrize("desc", [None, "", "   ", "\n\t  \n"])
@@ -94,3 +96,88 @@ def test_describe_round_trip_flips_direction() -> None:
     assert twice is not None
     assert describe(once).startswith("added")
     assert describe(twice).startswith("removed")
+
+
+# --- Site configuration -------------------------------------------------------
+
+WALLAPOP = Site(
+    name="wallapop",
+    catalog_url="https://es.wallapop.com/app/catalog/published",
+    edit_url="https://es.wallapop.com/app/catalog/edit/{item_id}",
+    link_pattern="/item/",
+    id_regex="/item/([^/?#]+)",
+    edit_control="editar|edit",
+    save_control="guardar|save",
+    reserved=("reservado",),
+    sold=("vendido",),
+)
+
+
+def test_item_id_is_pulled_from_a_listing_url() -> None:
+    href = "https://es.wallapop.com/item/mesa-de-roble-123456"
+    assert WALLAPOP.item_id(href) == "mesa-de-roble-123456"
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "",
+        "https://es.wallapop.com/app/catalog/published",
+        "https://es.wallapop.com/user/someone",
+    ],
+)
+def test_item_id_is_empty_when_the_url_is_not_a_listing(href: str) -> None:
+    # An empty id must fall back to clicking Edit, never to a malformed URL.
+    assert WALLAPOP.item_id(href) == ""
+
+
+def test_query_and_fragment_are_not_part_of_the_id() -> None:
+    href = "https://es.wallapop.com/item/mesa-123?utm=x#photos"
+    assert WALLAPOP.item_id(href) == "mesa-123"
+
+
+def test_edit_link_is_built_from_the_id() -> None:
+    href = "https://es.wallapop.com/item/mesa-123"
+    assert WALLAPOP.edit_link(href) == (
+        "https://es.wallapop.com/app/catalog/edit/mesa-123"
+    )
+
+
+def test_link_selector_wraps_the_pattern() -> None:
+    assert WALLAPOP.link_selector == 'a[href*="/item/"]'
+
+
+def test_control_patterns_ignore_case() -> None:
+    assert WALLAPOP.edit_pattern.search("EDITAR") is not None
+    assert WALLAPOP.save_pattern.search("Guardar cambios") is not None
+
+
+def test_the_shipped_config_loads() -> None:
+    sites = load_sites()
+    assert "wallapop" in sites
+    assert sites["wallapop"].link_pattern == "/item/"
+
+
+def test_a_missing_key_names_the_site_and_the_key(tmp_path: Path) -> None:
+    config = tmp_path / "sites.toml"
+    config.write_text(
+        '[vinted]\ncatalog_url = "https://example.test"\n', encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError) as caught:
+        load_sites(config)
+    message = str(caught.value)
+    assert "vinted" in message
+    assert "edit_url" in message
+
+
+def test_a_missing_config_file_is_reported(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError):
+        load_sites(tmp_path / "absent.toml")
+
+
+def test_an_empty_config_is_rejected(tmp_path: Path) -> None:
+    # A config with every site commented out must not run silently over nothing.
+    config = tmp_path / "sites.toml"
+    config.write_text("# nothing configured yet\n", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        load_sites(config)

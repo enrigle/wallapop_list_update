@@ -11,11 +11,16 @@ through Playwright: it starts a plain, non-automated Chrome on its own profile
 Protocol (CDP) — remote-controlling a normal browser instead of spawning a
 suspicious one.
 
+Sites live in sites.toml, one section each. Everything site-specific — catalog
+URL, edit URL, link shape, button words — is read from there, so adding a second
+marketplace is a config entry, not a code change.
+
 Usage:
     python bump.py login              # one-time: opens Chrome, you sign in, leave it running
     python bump.py run                # dry run (default): changes nothing
     python bump.py run --publish      # the real thing
-    python bump.py probe              # dump the catalog page for selector debugging
+    python bump.py run --site vinted  # one site instead of all of them
+    python bump.py probe --site vinted  # dump a catalog page for selector debugging
 
 If that Chrome is closed or the Mac reboots, the next run relaunches it from
 the saved profile. If Wallapop then asks for a login anyway, you get a
@@ -39,6 +44,7 @@ from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import tomllib
 from playwright.sync_api import (
     Browser,
     Locator,
@@ -54,17 +60,13 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeout
 HOME_DIR = Path.home() / ".wallapop-bump"
 PROFILE_DIR = HOME_DIR / "chrome-profile"
 LOG_FILE = HOME_DIR / "bump.log"
-PROBE_FILE = HOME_DIR / "probe.html"
+SITES_FILE = Path(__file__).resolve().parent / "sites.toml"
 
 KEYCHAIN_SERVICE = "wallabump-gmail"
 
 CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CDP_PORT = 9222
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
-
-SITE = "https://es.wallapop.com"
-CATALOG_URL = f"{SITE}/app/catalog/published"
-EDIT_URL = f"{SITE}/app/catalog/edit/{{item_id}}"
 
 # The edit that resurfaces the listing. Swap for a word pair (e.g. two closing
 # sentences) if a trailing period ever proves unsuitable; nothing else changes.
@@ -73,9 +75,6 @@ MARKER = "."
 # Only append the marker after a character that reads naturally before a period.
 # Anything else ("Te interesa?", "Talla 42,") would publish visible garbage.
 APPENDABLE_TAIL = re.compile(r"[\w)\]\"'»]$", re.UNICODE)
-
-EDIT_CONTROL = re.compile(r"editar|edit", re.IGNORECASE)
-SAVE_CONTROL = re.compile(r"guardar|actualizar|save|publicar", re.IGNORECASE)
 
 # Human-ish gap between listings. A whole catalog edited in 30s is a bot.
 PACE_SECONDS = (20.0, 90.0)
@@ -123,6 +122,91 @@ def describe(updated: str) -> str:
     return f"{direction} {MARKER!r} → …{updated[-20:]!r}"
 
 
+# --- Site configuration -------------------------------------------------------
+
+SITE_KEYS = (
+    "catalog_url",
+    "edit_url",
+    "link_pattern",
+    "id_regex",
+    "edit_control",
+    "save_control",
+    "reserved",
+    "sold",
+)
+
+
+@dataclass(frozen=True)
+class Site:
+    """One marketplace, as described by its section of sites.toml."""
+
+    name: str
+    catalog_url: str
+    edit_url: str
+    link_pattern: str
+    id_regex: str
+    edit_control: str
+    save_control: str
+    reserved: tuple[str, ...]
+    sold: tuple[str, ...]
+
+    def item_id(self, href: str) -> str:
+        """The listing id inside a listing URL, or "" when it does not match."""
+        match = re.search(self.id_regex, href)
+        return match.group(1) if match else ""
+
+    def edit_link(self, href: str) -> str:
+        return self.edit_url.format(item_id=self.item_id(href))
+
+    @property
+    def link_selector(self) -> str:
+        return f'a[href*="{self.link_pattern}"]'
+
+    @property
+    def edit_pattern(self) -> re.Pattern[str]:
+        return re.compile(self.edit_control, re.IGNORECASE)
+
+    @property
+    def save_pattern(self) -> re.Pattern[str]:
+        return re.compile(self.save_control, re.IGNORECASE)
+
+
+def load_sites(path: Path = SITES_FILE) -> dict[str, Site]:
+    """Read sites.toml. A missing key must fail loudly, not skip a wardrobe."""
+    if not path.exists():
+        raise RuntimeError(f"No site config at {path}")
+
+    with path.open("rb") as handle:
+        raw = tomllib.load(handle)
+
+    sites: dict[str, Site] = {}
+    for name, entry in raw.items():
+        missing = [key for key in SITE_KEYS if key not in entry]
+        if missing:
+            raise RuntimeError(
+                f"Site '{name}' in {path} is missing: {', '.join(missing)}"
+            )
+        sites[name] = Site(
+            name=name,
+            catalog_url=entry["catalog_url"],
+            edit_url=entry["edit_url"],
+            link_pattern=entry["link_pattern"],
+            id_regex=entry["id_regex"],
+            edit_control=entry["edit_control"],
+            save_control=entry["save_control"],
+            reserved=tuple(entry["reserved"]),
+            sold=tuple(entry["sold"]),
+        )
+
+    if not sites:
+        raise RuntimeError(f"No sites configured in {path}")
+    return sites
+
+
+def probe_file(site: Site) -> Path:
+    return HOME_DIR / f"probe-{site.name}.html"
+
+
 # --- Results ------------------------------------------------------------------
 
 
@@ -133,14 +217,10 @@ class Item:
     reserved: bool
     sold: bool
 
-    @property
-    def item_id(self) -> str:
-        match = re.search(r"/item/([^/?#]+)", self.href)
-        return match.group(1) if match else ""
-
 
 @dataclass
 class Result:
+    site: str
     title: str
     status: str  # ok | dry-run | skipped | unverified | failed
     reason: str = ""
@@ -159,18 +239,24 @@ class RunReport:
         if self.fatal:
             return f"Wallabump: FAILED — {self.fatal}"
         ok = self.count("ok") + self.count("dry-run")
-        return (
+        subject = (
             f"Wallabump: {ok} ok, "
             f"{self.count('skipped')} skipped, "
             f"{self.count('unverified')} unverified, "
             f"{self.count('failed')} failed"
         )
+        # Keep the re-auth signal readable from the lock screen even when only
+        # one of several sites has lost its session.
+        if any("RE-AUTH" in r.reason for r in self.results):
+            subject += " — RE-AUTH NEEDED"
+        return subject
 
     @property
     def body(self) -> str:
         lines = [self.fatal] if self.fatal else []
         lines += [
-            f"{r.status:<11} {r.title}" + (f"  — {r.reason}" if r.reason else "")
+            f"{r.site:<9} {r.status:<11} {r.title}"
+            + (f"  — {r.reason}" if r.reason else "")
             for r in self.results
         ]
         if not lines:
@@ -242,11 +328,13 @@ def send_email(report: RunReport) -> None:
 
 # --- Browser ------------------------------------------------------------------
 
+# Takes its site config as an argument rather than being built by string
+# interpolation, so no config value is ever spliced into JavaScript source.
 _COLLECT_JS = """
-() => {
+(cfg) => {
   const seen = new Set();
   const items = [];
-  for (const a of document.querySelectorAll('a[href*="/item/"]')) {
+  for (const a of document.querySelectorAll(cfg.selector)) {
     if (seen.has(a.href)) continue;
     seen.add(a.href);
     const card = a.closest('article, li, [class*="card" i]') || a;
@@ -255,8 +343,8 @@ _COLLECT_JS = """
       href: a.href,
       title: ((a.innerText || a.getAttribute('title') || '').trim().split('\\n')[0]
               || a.href),
-      reserved: text.includes('reservado') || text.includes('reserved'),
-      sold: text.includes('vendido') || text.includes('sold'),
+      reserved: cfg.reserved.some(word => text.includes(word)),
+      sold: cfg.sold.some(word => text.includes(word)),
     });
   }
   return items;
@@ -279,7 +367,7 @@ def setup_logging(verbose: bool) -> None:
 
 
 def find_textarea(page: Page, timeout: float = 8000) -> Locator | None:
-    """The description field. A Wallapop edit form has exactly one textarea."""
+    """The description field. Both sites' edit forms hold exactly one textarea."""
     textarea = page.locator("textarea").first
     try:
         textarea.wait_for(state="visible", timeout=timeout)
@@ -288,20 +376,20 @@ def find_textarea(page: Page, timeout: float = 8000) -> Locator | None:
     return textarea
 
 
-def is_logged_in(page: Page) -> bool:
+def is_logged_in(page: Page, site: Site) -> bool:
     if "login" in page.url or "auth" in page.url:
         return False
     try:
-        page.wait_for_selector('a[href*="/item/"]', timeout=15000)
+        page.wait_for_selector(site.link_selector, timeout=15000)
     except PlaywrightTimeout:
         return False
     return True
 
 
-def open_edit_form(page: Page, item: Item) -> Locator | None:
+def open_edit_form(page: Page, site: Site, item: Item) -> Locator | None:
     """Open the item's edit form. Tries the direct URL, falls back to clicking."""
-    if item.item_id:
-        page.goto(EDIT_URL.format(item_id=item.item_id), wait_until="domcontentloaded")
+    if site.item_id(item.href):
+        page.goto(site.edit_link(item.href), wait_until="domcontentloaded")
         textarea = find_textarea(page)
         if textarea is not None:
             return textarea
@@ -310,15 +398,15 @@ def open_edit_form(page: Page, item: Item) -> Locator | None:
         )
 
     page.goto(item.href, wait_until="domcontentloaded")
-    control = page.get_by_role("link", name=EDIT_CONTROL).or_(
-        page.get_by_role("button", name=EDIT_CONTROL)
+    control = page.get_by_role("link", name=site.edit_pattern).or_(
+        page.get_by_role("button", name=site.edit_pattern)
     )
     control.first.click(timeout=8000)
     return find_textarea(page)
 
 
-def read_description(page: Page, item: Item) -> tuple[str, int] | None:
-    textarea = open_edit_form(page, item)
+def read_description(page: Page, site: Site, item: Item) -> tuple[str, int] | None:
+    textarea = open_edit_form(page, site, item)
     if textarea is None:
         return None
     raw_maxlen = textarea.get_attribute("maxlength")
@@ -326,33 +414,39 @@ def read_description(page: Page, item: Item) -> tuple[str, int] | None:
     return textarea.input_value(), maxlen
 
 
-def bump_item(page: Page, item: Item, publish: bool) -> Result:
-    current = read_description(page, item)
+def bump_item(page: Page, site: Site, item: Item, publish: bool) -> Result:
+    current = read_description(page, site, item)
     if current is None:
-        return Result(item.title, "failed", "edit form not found")
+        return Result(site.name, item.title, "failed", "edit form not found")
 
     description, maxlen = current
     updated = toggle(description, maxlen)
     if updated is None:
-        return Result(item.title, "skipped", "description unsafe to toggle")
+        return Result(site.name, item.title, "skipped", "description unsafe to toggle")
 
     if not publish:
-        return Result(item.title, "dry-run", f"would have {describe(updated)}")
+        return Result(
+            site.name, item.title, "dry-run", f"would have {describe(updated)}"
+        )
 
     textarea = find_textarea(page)
     if textarea is None:
-        return Result(item.title, "failed", "edit form vanished before fill")
+        return Result(site.name, item.title, "failed", "edit form vanished before fill")
     textarea.fill(updated)
-    page.get_by_role("button", name=SAVE_CONTROL).first.click(timeout=8000)
+    page.get_by_role("button", name=site.save_pattern).first.click(timeout=8000)
     page.wait_for_timeout(4000)
 
     # Verify by reopening the form: same selector, so no second guess to be wrong.
-    saved = read_description(page, item)
+    saved = read_description(page, site, item)
     if saved is None:
-        return Result(item.title, "unverified", "could not reopen form to verify")
+        return Result(
+            site.name, item.title, "unverified", "could not reopen form to verify"
+        )
     if saved[0].rstrip() != updated:
-        return Result(item.title, "unverified", "description unchanged after save")
-    return Result(item.title, "ok", describe(updated))
+        return Result(
+            site.name, item.title, "unverified", "description unchanged after save"
+        )
+    return Result(site.name, item.title, "ok", describe(updated))
 
 
 def cdp_reachable() -> bool:
@@ -363,7 +457,7 @@ def cdp_reachable() -> bool:
         return False
 
 
-def launch_chrome() -> None:
+def launch_chrome(start_url: str) -> None:
     """Start a real, non-automated Chrome with its debugging port open.
 
     No `--enable-automation`, no Playwright involved in the launch — Chrome
@@ -381,7 +475,7 @@ def launch_chrome() -> None:
             f"--remote-debugging-port={CDP_PORT}",
             "--no-first-run",
             "--no-default-browser-check",
-            CATALOG_URL,
+            start_url,
         ],
         start_new_session=True,
         stdout=subprocess.DEVNULL,
@@ -389,12 +483,12 @@ def launch_chrome() -> None:
     )
 
 
-def ensure_chrome(wait_seconds: float = 15.0) -> None:
+def ensure_chrome(start_url: str, wait_seconds: float = 15.0) -> None:
     """Launch Chrome if the debugging port is dead, then wait for it."""
     if cdp_reachable():
         return
     log.info("Chrome not running; launching it from the saved profile.")
-    launch_chrome()
+    launch_chrome(start_url)
     deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         if cdp_reachable():
@@ -407,8 +501,8 @@ def ensure_chrome(wait_seconds: float = 15.0) -> None:
     )
 
 
-def attach(playwright: Playwright) -> Browser:
-    ensure_chrome()
+def attach(playwright: Playwright, start_url: str) -> Browser:
+    ensure_chrome(start_url)
     try:
         return playwright.chromium.connect_over_cdp(CDP_URL, timeout=5000)
     except PlaywrightError as exc:
@@ -418,7 +512,65 @@ def attach(playwright: Playwright) -> Browser:
         ) from exc
 
 
-def run(publish: bool, limit: int) -> RunReport:
+def collect(page: Page, site: Site) -> list[Item]:
+    raw = page.evaluate(
+        _COLLECT_JS,
+        {
+            "selector": site.link_selector,
+            "reserved": list(site.reserved),
+            "sold": list(site.sold),
+        },
+    )
+    return [Item(**entry) for entry in raw]
+
+
+def bump_site(
+    page: Page, browser: Browser, site: Site, publish: bool, limit: int
+) -> tuple[list[Result], str]:
+    """Bump one site. Returns its results and a fatal message, "" when fine.
+
+    A site that cannot be read is that site's problem: it reports a failure and
+    the caller moves on to the next one. Only a dead browser is fatal, because
+    then no site can be reached.
+    """
+    results: list[Result] = []
+    page.goto(site.catalog_url, wait_until="domcontentloaded")
+
+    if not is_logged_in(page, site):
+        reason = "RE-AUTH NEEDED — run: python bump.py login"
+        log.error("%s: %s", site.name, reason)
+        return [Result(site.name, site.catalog_url, "failed", reason)], ""
+
+    items = collect(page, site)
+    log.info("%s: found %d listings", site.name, len(items))
+
+    for item in items:
+        if item.reserved or item.sold:
+            state = "reserved" if item.reserved else "sold"
+            results.append(Result(site.name, item.title, "skipped", state))
+
+    active = [i for i in items if not i.reserved and not i.sold]
+    if limit > 0:
+        active = active[:limit]
+
+    for index, item in enumerate(active):
+        try:
+            result = bump_item(page, site, item, publish)
+        except (PlaywrightError, PlaywrightTimeout, ValueError) as exc:
+            result = Result(site.name, item.title, "failed", type(exc).__name__)
+        log.info("%s: %s %s", item.title, result.status, result.reason)
+        results.append(result)
+
+        if page.is_closed() or not browser.is_connected():
+            return results, "Browser connection lost mid-run (Mac asleep?)"
+
+        if index < len(active) - 1:
+            time.sleep(random.uniform(*PACE_SECONDS))
+
+    return results, ""
+
+
+def run(sites: list[Site], publish: bool, limit: int) -> RunReport:
     report = RunReport()
     ensure_dirs()
 
@@ -427,45 +579,17 @@ def run(publish: bool, limit: int) -> RunReport:
     subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())])
 
     with sync_playwright() as playwright:
-        browser = attach(playwright)
+        browser = attach(playwright, sites[0].catalog_url)
         context = browser.contexts[0]
         page = context.new_page()
         try:
-            page.goto(CATALOG_URL, wait_until="domcontentloaded")
-
-            if not is_logged_in(page):
-                report.fatal = "RE-AUTH NEEDED — run: python bump.py login"
-                log.error(report.fatal)
-                return report
-
-            raw = page.evaluate(_COLLECT_JS)
-            items = [Item(**entry) for entry in raw]
-            log.info("Found %d listings", len(items))
-
-            active = [i for i in items if not i.reserved and not i.sold]
-            for item in items:
-                if item.reserved or item.sold:
-                    state = "reserved" if item.reserved else "sold"
-                    report.results.append(Result(item.title, "skipped", state))
-
-            if limit > 0:
-                active = active[:limit]
-
-            for index, item in enumerate(active):
-                try:
-                    result = bump_item(page, item, publish)
-                except (PlaywrightError, PlaywrightTimeout, ValueError) as exc:
-                    result = Result(item.title, "failed", type(exc).__name__)
-                log.info("%s: %s %s", item.title, result.status, result.reason)
-                report.results.append(result)
-
-                if page.is_closed() or not browser.is_connected():
-                    report.fatal = "Browser connection lost mid-run (Mac asleep?)"
-                    log.error(report.fatal)
+            for site in sites:
+                results, fatal = bump_site(page, browser, site, publish, limit)
+                report.results.extend(results)
+                if fatal:
+                    report.fatal = fatal
+                    log.error(fatal)
                     return report
-
-                if index < len(active) - 1:
-                    time.sleep(random.uniform(*PACE_SECONDS))
         finally:
             try:
                 page.close()  # only our tab — the user's Chrome keeps running
@@ -475,50 +599,67 @@ def run(publish: bool, limit: int) -> RunReport:
     return report
 
 
-def login() -> int:
-    """Get a signed-in, remote-debuggable Chrome running, then verify it."""
+def login(sites: list[Site]) -> int:
+    """Get a signed-in, remote-debuggable Chrome running, then verify each site.
+
+    One profile carries every site's session, so this checks them all and names
+    the ones still needing a sign-in.
+    """
     if cdp_reachable():
         log.info("Chrome with remote debugging is already running.")
     else:
         log.info("Opening Chrome — sign in, then come back here.")
-        launch_chrome()
+        launch_chrome(sites[0].catalog_url)
 
-    input("Press Enter once your listings are visible… ")
+    names = ", ".join(site.name for site in sites)
+    input(f"Press Enter once you are signed in to {names}… ")
 
     if PROFILE_DIR.exists():
         os.chmod(PROFILE_DIR, 0o700)
 
+    missing: list[str] = []
     with sync_playwright() as playwright:
-        browser = attach(playwright)
-        page = browser.contexts[0].new_page()
-        page.goto(CATALOG_URL, wait_until="domcontentloaded")
-        logged_in = is_logged_in(page)
-        page.close()
-
-    if logged_in:
-        log.info("Session confirmed. Leave this Chrome window open and running —")
-        log.info("do not Cmd+Q it or restart the Mac between scheduled runs.")
-    else:
-        log.info("NOT logged in yet — finish signing in, then run this again.")
-    return 0 if logged_in else 2
-
-
-def probe() -> int:
-    """Dump the catalog page so selectors can be fixed when Wallapop changes."""
-    ensure_dirs()
-    with sync_playwright() as playwright:
-        browser = attach(playwright)
+        browser = attach(playwright, sites[0].catalog_url)
         page = browser.contexts[0].new_page()
         try:
-            page.goto(CATALOG_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(5000)
-            PROBE_FILE.write_text(page.content(), encoding="utf-8")
-            log.info("URL: %s", page.url)
-            log.info(
-                "Anchors matching /item/: %d",
-                page.locator('a[href*="/item/"]').count(),
-            )
-            log.info("Wrote %s", PROBE_FILE)
+            for site in sites:
+                page.goto(site.catalog_url, wait_until="domcontentloaded")
+                if is_logged_in(page, site):
+                    log.info("%s: session confirmed.", site.name)
+                else:
+                    log.info("%s: NOT logged in.", site.name)
+                    missing.append(site.name)
+        finally:
+            page.close()
+
+    if missing:
+        log.info("Finish signing in to %s, then run this again.", ", ".join(missing))
+        return 2
+
+    log.info("All sessions confirmed. Chrome may be closed; runs relaunch it.")
+    return 0
+
+
+def probe(sites: list[Site]) -> int:
+    """Dump each catalog page so selectors can be fixed after a redesign."""
+    ensure_dirs()
+    with sync_playwright() as playwright:
+        browser = attach(playwright, sites[0].catalog_url)
+        page = browser.contexts[0].new_page()
+        try:
+            for site in sites:
+                page.goto(site.catalog_url, wait_until="domcontentloaded")
+                page.wait_for_timeout(5000)
+                target = probe_file(site)
+                target.write_text(page.content(), encoding="utf-8")
+                log.info("%s: URL %s", site.name, page.url)
+                log.info(
+                    "%s: anchors matching %s: %d",
+                    site.name,
+                    site.link_pattern,
+                    page.locator(site.link_selector).count(),
+                )
+                log.info("%s: wrote %s", site.name, target)
         finally:
             page.close()
     return 0
@@ -532,20 +673,43 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="actually save changes (default is a dry run)",
     )
-    parser.add_argument("--limit", type=int, default=0, help="only touch N listings")
+    parser.add_argument(
+        "--limit", type=int, default=0, help="only touch N listings per site"
+    )
+    parser.add_argument(
+        "--site", default="all", help="a site from sites.toml, or 'all' (default)"
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     setup_logging(args.verbose)
 
-    if args.command == "login":
-        return login()
-    if args.command == "probe":
-        return probe()
-
-    log.info("Starting run (publish=%s, limit=%s)", args.publish, args.limit or "all")
     try:
-        report = run(args.publish, args.limit)
+        configured = load_sites()
+        if args.site == "all":
+            chosen = list(configured.values())
+        elif args.site in configured:
+            chosen = [configured[args.site]]
+        else:
+            known = ", ".join(sorted(configured))
+            raise RuntimeError(f"Unknown site '{args.site}'. Configured: {known}")
+    except RuntimeError as exc:
+        log.error("%s", exc)
+        return 2
+
+    if args.command == "login":
+        return login(chosen)
+    if args.command == "probe":
+        return probe(chosen)
+
+    log.info(
+        "Starting run (sites=%s, publish=%s, limit=%s)",
+        ", ".join(site.name for site in chosen),
+        args.publish,
+        args.limit or "all",
+    )
+    try:
+        report = run(chosen, args.publish, args.limit)
     except (RuntimeError, PlaywrightError, PlaywrightTimeout, OSError) as exc:
         report = RunReport(fatal=str(exc))
         log.exception("Run aborted")
