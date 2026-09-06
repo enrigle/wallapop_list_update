@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.enrigle.wallabump</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/enrigle/Documents/code/wallapop/.venv/bin/python</string>
+        <string>/Users/enrigle/Documents/code/wallapop/bump.py</string>
+        <string>run</string>
+        <string>--publish</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/enrigle/Documents/code/wallapop</string>
+
+    <!-- Wednesday (3) and Saturday (6) at 10:00. pmset wakes the Mac at 09:55. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>10</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>6</integer>
+            <key>Hour</key><integer>10</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/enrigle/.wallapop-bump/launchd.err</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/enrigle/.wallapop-bump/launchd.out</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
