@@ -106,6 +106,8 @@ WALLAPOP = Site(
     edit_url="https://es.wallapop.com/app/catalog/edit/{item_id}",
     link_pattern="/item/",
     id_regex="/item/([^/?#]+)",
+    card_selector="article, li",
+    description_selector="textarea",
     edit_control="editar|edit",
     save_control="guardar|save",
     reserved=("reservado",),
@@ -152,10 +154,64 @@ def test_control_patterns_ignore_case() -> None:
     assert WALLAPOP.save_pattern.search("Guardar cambios") is not None
 
 
+VINTED = Site(
+    name="vinted",
+    catalog_url="https://www.vinted.es/member/185114459",
+    edit_url="https://www.vinted.es/items/{item_id}/edit",
+    link_pattern="/items/",
+    id_regex=r"/items/(\d+)",
+    card_selector='[data-testid^="product-item-id"]',
+    description_selector='textarea[name="description"]',
+    edit_control="editar|edit",
+    save_control="guardar|save",
+    reserved=("reservado",),
+    sold=("vendido",),
+)
+
+
+def test_vinted_id_is_the_digits_only() -> None:
+    assert VINTED.item_id("https://www.vinted.es/items/9873738631") == "9873738631"
+
+
+def test_vinted_id_ignores_the_slug_and_query() -> None:
+    href = "https://www.vinted.es/items/9883610791-pesas-de-mano?homepage_session_id=x"
+    assert VINTED.item_id(href) == "9883610791"
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "https://www.vinted.es/items/new",
+        "https://www.vinted.es/member/items/favourite_list",
+    ],
+)
+def test_vinted_non_listing_links_have_no_id(href: str) -> None:
+    # Both match link_pattern but are not listings; collect() drops them on this.
+    assert VINTED.item_id(href) == ""
+
+
+def test_vinted_edit_link_is_built_from_the_id() -> None:
+    href = "https://www.vinted.es/items/9873738631-lote"
+    assert VINTED.edit_link(href) == ("https://www.vinted.es/items/9873738631/edit")
+
+
 def test_the_shipped_config_loads() -> None:
     sites = load_sites()
-    assert "wallapop" in sites
+    assert set(sites) == {"wallapop", "vinted"}
     assert sites["wallapop"].link_pattern == "/item/"
+    assert sites["vinted"].description_selector == 'textarea[name="description"]'
+
+
+def test_every_shipped_edit_url_takes_an_item_id() -> None:
+    for site in load_sites().values():
+        assert "{item_id}" in site.edit_url, site.name
+
+
+def test_every_shipped_id_regex_has_one_group() -> None:
+    import re as _re
+
+    for site in load_sites().values():
+        assert _re.compile(site.id_regex).groups == 1, site.name
 
 
 def test_a_missing_key_names_the_site_and_the_key(tmp_path: Path) -> None:

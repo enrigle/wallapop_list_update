@@ -2,7 +2,7 @@
 
 Twice week (Wed + Sat, 10:00), toggle one char in every active listing so items resurface in feeds. Emails receipt after every run.
 
-Sites are config, not code. `sites.toml` holds one section per marketplace — catalogue URL, edit URL, link shape, button words. Adding a second marketplace is a config entry.
+Two sites configured: **Wallapop** and **Vinted**. Sites are config, not code — `sites.toml` holds one section per marketplace, so a third is a config entry.
 
 No LLM, no API key, no cloud. One dependency (`playwright`), driving your real Chrome from your machine at human pace.
 
@@ -13,7 +13,7 @@ No LLM, no API key, no cloud. One dependency (`playwright`), driving your real C
 - [Commands](#commands) — cheat sheet
 - [How it works](#how-it-works) — the run, start to finish
 - [Why a separate Chrome](#why-a-separate-chrome) — the one non-obvious design choice
-- [Setup](#setup) — seven steps, once
+- [Setup](#setup) — eight steps, once
 - [Daily life](#daily-life) — reading the email
 - [Troubleshooting](#troubleshooting) — symptom, cause, fix
 - [What it edits](#what-it-edits) — and what it refuses to
@@ -50,6 +50,8 @@ All take the venv interpreter: `.venv/bin/python bump.py …`
 7. **Verify.** Reopens the form and compares. Mismatch → `unverified`.
 8. **Pace.** Sleeps 20 to 90s between listings, random.
 9. **Report.** One email covering every site, exits 0 (clean), 1 (some failures), or 2 (fatal).
+
+**Site quirks are config, not special cases.** Vinted's edit form holds two textareas, so its section names the description one rather than trusting `.first`. Its cards hang off a `data-testid` instead of an `<article>`, and its grid renders lazily, so a run scrolls the wardrobe before reading it. Links matching the pattern but carrying no id, like Vinted's `/items/new`, are dropped.
 
 **One site failing does not stop the others.** A site that will not load, or whose session expired, records its own `failed` line and the run moves to the next. Only a dead browser aborts everything.
 
@@ -97,7 +99,13 @@ Prompts for password. Use Gmail **app password** (<https://myaccount.google.com/
 
 Nothing else stores a credential. No secret ever lands in the repo.
 
-### 3. Sign in once
+### 3. Point Vinted at your own wardrobe
+
+`catalog_url` under `[vinted]` in `sites.toml` contains a member id, so it is account-specific. Open Vinted, click **Armario** in the header, and copy the URL. It looks like `https://www.vinted.es/member/185114459`.
+
+Wallapop needs no such edit — its catalogue URL is the same for every account.
+
+### 4. Sign in once
 
 ```bash
 .venv/bin/python bump.py login
@@ -107,7 +115,7 @@ Opens real Chrome (not automated) on profile at `~/.wallapop-bump/chrome-profile
 
 Can close that Chrome after. Runs relaunch as needed.
 
-### 4. Dry run
+### 5. Dry run
 
 ```bash
 .venv/bin/python bump.py run
@@ -115,15 +123,15 @@ Can close that Chrome after. Runs relaunch as needed.
 
 Changes nothing. Confirm email arrives and listing titles match reality.
 
-### 5. First real edit, one item
+### 6. First real edit, one item
 
 ```bash
 .venv/bin/python bump.py run --publish --limit 1
 ```
 
-Open Wallapop by hand, confirm description changed.
+One listing per site. Open both by hand, confirm the descriptions changed.
 
-### 6. Schedule it
+### 7. Schedule it
 
 ```bash
 cp com.enrigle.wallabump.plist ~/Library/LaunchAgents/
@@ -143,7 +151,7 @@ cp com.enrigle.wallabump.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.enrigle.wallabump.plist
 ```
 
-### 7. Wake the Mac for it
+### 8. Wake the Mac for it
 
 ```bash
 sudo pmset repeat wakeorpoweron WS 09:55:00
@@ -183,6 +191,10 @@ First column is the site.
 Direction alternates run to run. Both directions bump the listing equally — an edit is an edit.
 
 **Silence is the failure signal.** No email means run never happened — check `~/.wallapop-bump/bump.log`.
+
+### A caveat on sold and reserved
+
+Both sites are told which badge words mean "leave it alone". That was verified on Wallapop, where reserved and sold listings do appear in the catalogue. It could not be verified on Vinted, because the wardrobe held no sold or reserved listing to read the wording off. If Vinted words its badge differently, such a listing would get its period toggled. The cost is one pointless edit to something already sold, not a damaged listing.
 
 ### Statuses
 
@@ -225,7 +237,7 @@ Trailing period, toggled on and off. Nothing else — never title, price, photos
 
 Descriptions it refuses to touch, to avoid publishing visible garbage:
 
-- empty or whitespace-only
+- empty or whitespace-only, on either site
 - ending in `..` or `...` — stripping one dot reads as typo
 - ending in other punctuation (`?`, `!`, `,`, `:`) — `"Te interesa?."` wrong
 - already at field `maxlength`
@@ -252,4 +264,4 @@ To switch to word pair instead (e.g. two alternating closing sentences), change 
 | `sites.toml` | Per-site URLs and selectors. Edit this when a site redesigns. |
 | `test_bump.py` | Edge cases for the pure functions and the config loader. |
 | `com.enrigle.wallabump.plist` | launchd schedule. Copy to `~/Library/LaunchAgents/`. |
-| `~/.wallapop-bump/` | Chrome profile, log, probe dump. Never in the repo. |
+| `~/.wallapop-bump/` | Chrome profile, log, per-site probe dumps. Never in the repo. |

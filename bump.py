@@ -129,6 +129,8 @@ SITE_KEYS = (
     "edit_url",
     "link_pattern",
     "id_regex",
+    "card_selector",
+    "description_selector",
     "edit_control",
     "save_control",
     "reserved",
@@ -145,6 +147,8 @@ class Site:
     edit_url: str
     link_pattern: str
     id_regex: str
+    card_selector: str
+    description_selector: str
     edit_control: str
     save_control: str
     reserved: tuple[str, ...]
@@ -192,6 +196,8 @@ def load_sites(path: Path = SITES_FILE) -> dict[str, Site]:
             edit_url=entry["edit_url"],
             link_pattern=entry["link_pattern"],
             id_regex=entry["id_regex"],
+            card_selector=entry["card_selector"],
+            description_selector=entry["description_selector"],
             edit_control=entry["edit_control"],
             save_control=entry["save_control"],
             reserved=tuple(entry["reserved"]),
@@ -337,7 +343,7 @@ _COLLECT_JS = """
   for (const a of document.querySelectorAll(cfg.selector)) {
     if (seen.has(a.href)) continue;
     seen.add(a.href);
-    const card = a.closest('article, li, [class*="card" i]') || a;
+    const card = a.closest(cfg.card) || a;
     const text = (card.innerText || '').toLowerCase();
     items.push({
       href: a.href,
@@ -366,9 +372,15 @@ def setup_logging(verbose: bool) -> None:
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
-def find_textarea(page: Page, timeout: float = 8000) -> Locator | None:
-    """The description field. Both sites' edit forms hold exactly one textarea."""
-    textarea = page.locator("textarea").first
+def find_textarea(page: Page, site: Site, timeout: float = 8000) -> Locator | None:
+    """The description field.
+
+    Wallapop's edit form holds one textarea; Vinted's holds two, the second
+    being an unrelated single-character field. Taking `.first` blindly would be
+    right by luck on one site and a coin flip on the next, so each site names
+    its own selector in sites.toml.
+    """
+    textarea = page.locator(site.description_selector).first
     try:
         textarea.wait_for(state="visible", timeout=timeout)
     except PlaywrightTimeout:
@@ -390,7 +402,7 @@ def open_edit_form(page: Page, site: Site, item: Item) -> Locator | None:
     """Open the item's edit form. Tries the direct URL, falls back to clicking."""
     if site.item_id(item.href):
         page.goto(site.edit_link(item.href), wait_until="domcontentloaded")
-        textarea = find_textarea(page)
+        textarea = find_textarea(page, site)
         if textarea is not None:
             return textarea
         log.debug(
@@ -402,7 +414,7 @@ def open_edit_form(page: Page, site: Site, item: Item) -> Locator | None:
         page.get_by_role("button", name=site.edit_pattern)
     )
     control.first.click(timeout=8000)
-    return find_textarea(page)
+    return find_textarea(page, site)
 
 
 def read_description(page: Page, site: Site, item: Item) -> tuple[str, int] | None:
@@ -429,7 +441,7 @@ def bump_item(page: Page, site: Site, item: Item, publish: bool) -> Result:
             site.name, item.title, "dry-run", f"would have {describe(updated)}"
         )
 
-    textarea = find_textarea(page)
+    textarea = find_textarea(page, site)
     if textarea is None:
         return Result(site.name, item.title, "failed", "edit form vanished before fill")
     textarea.fill(updated)
@@ -512,16 +524,41 @@ def attach(playwright: Playwright, start_url: str) -> Browser:
         ) from exc
 
 
+def load_whole_page(page: Page, site: Site, rounds: int = 15) -> None:
+    """Scroll until the listing count stops growing.
+
+    Vinted's wardrobe is a lazy grid: cards below the fold are not rendered, so
+    they report no text at all and every reserved or sold badge reads as absent.
+    Scrolling first is what makes those badges visible.
+    """
+    seen = -1
+    for _ in range(rounds):
+        count = page.locator(site.link_selector).count()
+        if count == seen:
+            break
+        seen = count
+        page.mouse.wheel(0, 5000)
+        page.wait_for_timeout(800)
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(1000)
+
+
 def collect(page: Page, site: Site) -> list[Item]:
+    load_whole_page(page, site)
     raw = page.evaluate(
         _COLLECT_JS,
         {
             "selector": site.link_selector,
+            "card": site.card_selector,
             "reserved": list(site.reserved),
             "sold": list(site.sold),
         },
     )
-    return [Item(**entry) for entry in raw]
+    items = [Item(**entry) for entry in raw]
+    # A link matching the pattern is not always a listing: Vinted's wardrobe
+    # also carries /items/new and a favourites link. Anything without an id is
+    # not something we can open an edit form for.
+    return [item for item in items if site.item_id(item.href)]
 
 
 def bump_site(

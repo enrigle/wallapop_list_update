@@ -4,36 +4,44 @@
 # When a site redesigns, `bump.py probe --site <name>` dumps its catalog page;
 # fix the values below against that dump rather than touching bump.py.
 #
-#   catalog_url   page listing everything you have for sale
-#   edit_url      edit form for one listing; must contain {item_id}
-#   link_pattern  substring that marks an anchor as a listing link
-#   id_regex      one capture group pulling the listing id out of that href
-#   edit_control  words on the "edit" link or button, as a regex, case-insensitive
-#   save_control  words on the save button, same
-#   reserved      badge words meaning "do not touch, it is reserved"
-#   sold          badge words meaning "do not touch, it is sold"
+#   catalog_url           page listing everything you have for sale
+#   edit_url              edit form for one listing; must contain {item_id}
+#   link_pattern          substring that marks an anchor as a listing link
+#   id_regex              one capture group pulling the listing id out of that href
+#   card_selector         ancestor of the link holding the listing's badges
+#   description_selector  the description textarea on the edit form
+#   edit_control          words on the "edit" link or button, as a regex, case-insensitive
+#   save_control          words on the save button, same
+#   reserved              badge words meaning "do not touch, it is reserved"
+#   sold                  badge words meaning "do not touch, it is sold"
 
 [wallapop]
 catalog_url = "https://es.wallapop.com/app/catalog/published"
 edit_url = "https://es.wallapop.com/app/catalog/edit/{item_id}"
 link_pattern = "/item/"
 id_regex = "/item/([^/?#]+)"
+card_selector = "article, li, [class*=\"card\" i]"
+description_selector = "textarea"
 edit_control = "editar|edit"
 save_control = "guardar|actualizar|save|publicar"
 reserved = ["reservado", "reserved"]
 sold = ["vendido", "sold"]
 
-# Vinted is not configured yet. Sign in to Vinted in the shared Chrome, run
-# `python bump.py probe --site vinted`, and fill these in from the dump. Adding
-# the section before the values are real would publish edits at guessed
-# selectors, so it stays commented out until then.
+# The wardrobe URL carries the member id, so it is account-specific. Find yours
+# with the "Armario" link in Vinted's own header.
 #
-# [vinted]
-# catalog_url = ""
-# edit_url = ""
-# link_pattern = ""
-# id_regex = ""
-# edit_control = ""
-# save_control = ""
-# reserved = []
-# sold = []
+# Vinted's edit form has two textareas, hence the named description selector;
+# taking the first would be right only by accident. Its cards hang off a
+# data-testid rather than an <article>, and its grid renders lazily, which the
+# scroll pass in load_whole_page() handles.
+[vinted]
+catalog_url = "https://www.vinted.es/member/185114459"
+edit_url = "https://www.vinted.es/items/{item_id}/edit"
+link_pattern = "/items/"
+id_regex = "/items/(\\d+)"
+card_selector = "[data-testid^=\"product-item-id\"]"
+description_selector = "textarea[name=\"description\"]"
+edit_control = "editar|edit"
+save_control = "guardar|save"
+reserved = ["reservado", "reserved"]
+sold = ["vendido", "sold"]
