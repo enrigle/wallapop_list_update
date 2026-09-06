@@ -113,6 +113,16 @@ def toggle(desc: str | None, maxlen: int) -> str | None:
     return text + MARKER
 
 
+def describe(updated: str) -> str:
+    """Say which way toggle() went and what the text now ends with.
+
+    toggle() never returns a removal result ending in MARKER, and refuses the
+    doubled-marker case outright, so endswith is an exact test of the direction.
+    """
+    direction = "added" if updated.endswith(MARKER) else "removed"
+    return f"{direction} {MARKER!r} → …{updated[-20:]!r}"
+
+
 # --- Results ------------------------------------------------------------------
 
 
@@ -327,7 +337,7 @@ def bump_item(page: Page, item: Item, publish: bool) -> Result:
         return Result(item.title, "skipped", "description unsafe to toggle")
 
     if not publish:
-        return Result(item.title, "dry-run", f"would set …{updated[-20:]!r}")
+        return Result(item.title, "dry-run", f"would have {describe(updated)}")
 
     textarea = find_textarea(page)
     if textarea is None:
@@ -342,7 +352,7 @@ def bump_item(page: Page, item: Item, publish: bool) -> Result:
         return Result(item.title, "unverified", "could not reopen form to verify")
     if saved[0].rstrip() != updated:
         return Result(item.title, "unverified", "description unchanged after save")
-    return Result(item.title, "ok")
+    return Result(item.title, "ok", describe(updated))
 
 
 def cdp_reachable() -> bool:

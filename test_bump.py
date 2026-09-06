@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from bump import MARKER, toggle
+from bump import MARKER, describe, toggle
 
 
 @pytest.mark.parametrize("desc", [None, "", "   ", "\n\t  \n"])
@@ -64,3 +64,33 @@ def test_other_trailing_punctuation_is_skipped(desc: str) -> None:
 def test_closing_bracket_and_quote_still_accept_a_marker() -> None:
     assert toggle("Mesa (roble)", 640) == "Mesa (roble)."
     assert toggle('Modelo "Kallax"', 640) == 'Modelo "Kallax".'
+
+
+def test_describe_reports_an_appended_marker() -> None:
+    updated = toggle("Zapatillas talla 42", 640)
+    assert updated is not None
+    assert describe(updated).startswith("added")
+
+
+def test_describe_reports_a_removed_marker() -> None:
+    updated = toggle("Zapatillas talla 42.", 640)
+    assert updated is not None
+    assert describe(updated).startswith("removed")
+
+
+def test_describe_shows_the_last_twenty_characters() -> None:
+    text = "Mesa de roble maciza restaurada."
+    assert describe(text).endswith(repr(text[-20:]))
+
+
+def test_describe_shows_short_text_whole() -> None:
+    assert describe("Mesa.").endswith(repr("Mesa."))
+
+
+def test_describe_round_trip_flips_direction() -> None:
+    once = toggle("Silla vintage", 640)
+    assert once is not None
+    twice = toggle(once, 640)
+    assert twice is not None
+    assert describe(once).startswith("added")
+    assert describe(twice).startswith("removed")
