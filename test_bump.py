@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
-from bump import MARKER, Site, describe, load_sites, toggle
+from bump import MARKER, Site, describe, load_sites, slept_seconds, toggle
 
 
 @pytest.mark.parametrize("desc", [None, "", "   ", "\n\t  \n"])
@@ -237,3 +238,32 @@ def test_an_empty_config_is_rejected(tmp_path: Path) -> None:
     config.write_text("# nothing configured yet\n", encoding="utf-8")
     with pytest.raises(RuntimeError):
         load_sites(config)
+
+
+# --- Sleep detection ----------------------------------------------------------
+
+
+def test_no_sleep_reports_effectively_zero() -> None:
+    # Both clocks advanced together: the process ran without a break. The two
+    # reads are microseconds apart, so this is near-zero rather than exact.
+    mark = (time.time(), time.monotonic())
+    assert slept_seconds(mark) < 0.01
+
+
+def test_a_suspension_shows_up_as_the_wall_clock_running_ahead() -> None:
+    # Pretend the wall clock started 10 min ago while monotonic started now:
+    # that is exactly the shape of a process suspended for 10 minutes.
+    mark = (time.time() - 600.0, time.monotonic())
+    assert slept_seconds(mark) == pytest.approx(600.0, abs=2.0)
+
+
+def test_a_slow_step_without_sleep_is_not_reported_as_sleep() -> None:
+    # Both clocks 10 min back: the step really did take 10 min while awake.
+    mark = (time.time() - 600.0, time.monotonic() - 600.0)
+    assert slept_seconds(mark) == pytest.approx(0.0, abs=2.0)
+
+
+def test_backwards_drift_never_returns_a_negative() -> None:
+    # A wall clock nudged forward by NTP must not read as negative sleep.
+    mark = (time.time() + 30.0, time.monotonic())
+    assert slept_seconds(mark) == 0.0

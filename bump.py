@@ -68,6 +68,14 @@ CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CDP_PORT = 9222
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 
+# The handshake happens right after a scheduled wake, when the machine is still
+# coming up. 5s was too tight and reported a live browser as unreachable.
+CDP_TIMEOUT_MS = 30000
+
+# A suspended process keeps its wall clock but loses monotonic time, so a gap
+# between the two is proof the Mac slept rather than the step being slow.
+SLEEP_DRIFT_SECONDS = 60.0
+
 # The edit that resurfaces the listing. Swap for a word pair (e.g. two closing
 # sentences) if a trailing period ever proves unsuitable; nothing else changes.
 MARKER = "."
@@ -211,6 +219,22 @@ def load_sites(path: Path = SITES_FILE) -> dict[str, Site]:
 
 def probe_file(site: Site) -> Path:
     return HOME_DIR / f"probe-{site.name}.html"
+
+
+def slept_seconds(mark: tuple[float, float]) -> float:
+    """Seconds the machine spent suspended since `mark` was taken.
+
+    `time.monotonic()` stops while macOS sleeps; `time.time()` does not. The
+    difference between how much each advanced is the time spent asleep.
+    Returns 0.0 when the clocks agree, i.e. the process ran without a break.
+    """
+    wall_then, mono_then = mark
+    drift = (time.time() - wall_then) - (time.monotonic() - mono_then)
+    return drift if drift > 0 else 0.0
+
+
+def clock_mark() -> tuple[float, float]:
+    return time.time(), time.monotonic()
 
 
 # --- Results ------------------------------------------------------------------
@@ -514,10 +538,25 @@ def ensure_chrome(start_url: str, wait_seconds: float = 15.0) -> None:
 
 
 def attach(playwright: Playwright, start_url: str) -> Browser:
+    """Connect to the already-running Chrome over CDP.
+
+    The timeout is generous because the handshake follows a wake: five seconds
+    was enough to fail on a machine that had just come back from sleep, while
+    the port itself was answering perfectly well.
+    """
     ensure_chrome(start_url)
     try:
-        return playwright.chromium.connect_over_cdp(CDP_URL, timeout=5000)
+        return playwright.chromium.connect_over_cdp(CDP_URL, timeout=CDP_TIMEOUT_MS)
     except PlaywrightError as exc:
+        # Distinguish "nothing is listening" from "it answered, then stalled".
+        # Reporting a stalled handshake as an unreachable browser sends you off
+        # to re-run `login`, which fixes nothing.
+        if cdp_reachable():
+            raise RuntimeError(
+                f"Chrome answered at {CDP_URL} but the CDP handshake did not "
+                f"finish within {CDP_TIMEOUT_MS // 1000}s. The Mac was probably "
+                "asleep or mid-wake."
+            ) from exc
         raise RuntimeError(
             f"Chrome with remote debugging isn't reachable at {CDP_URL}. "
             "Run: python bump.py login"
@@ -590,6 +629,7 @@ def bump_site(
     if limit > 0:
         active = active[:limit]
 
+    mark = clock_mark()
     for index, item in enumerate(active):
         try:
             result = bump_item(page, site, item, publish)
@@ -600,6 +640,18 @@ def bump_site(
 
         if page.is_closed() or not browser.is_connected():
             return results, "Browser connection lost mid-run (Mac asleep?)"
+
+        # On battery a scheduled wake is a DarkWake: a few seconds of CPU, then
+        # back to sleep. Without this the run limps on for hours, one item per
+        # wake, and reports nonsense. Nothing is lost by stopping — there is no
+        # state file, so the next run reads the live descriptions and continues.
+        asleep = slept_seconds(mark)
+        if asleep > SLEEP_DRIFT_SECONDS:
+            return results, (
+                f"Mac slept for {asleep / 60:.0f} min mid-run; abandoning. "
+                "Scheduled wake on battery only gives a DarkWake."
+            )
+        mark = clock_mark()
 
         if index < len(active) - 1:
             time.sleep(random.uniform(*PACE_SECONDS))

@@ -1,6 +1,6 @@
 # Wallabump
 
-Twice week (Wed + Sat, 10:00), toggle one char in every active listing so items resurface in feeds. Emails receipt after every run.
+Twice week (Thu + Sun, 21:55), toggle one char in every active listing so items resurface in feeds. Emails receipt after every run.
 
 Two sites configured: **Wallapop** and **Vinted**. Sites are config, not code — `sites.toml` holds one section per marketplace, so a third is a config entry.
 
@@ -43,7 +43,7 @@ All take the venv interpreter: `.venv/bin/python bump.py …`
 
 1. **Load config.** Reads `sites.toml`. A missing key names the site and the key, and exits 2 rather than running half-configured.
 2. **Attach.** Checks `127.0.0.1:9222`. Dead → launches plain Chrome on the saved profile, waits up to 15s.
-3. **Stay awake.** Spawns `caffeinate -i` for the run's lifetime. A full catalog takes ~25 min per site and idle sleep kills the connection.
+3. **Stay awake.** Spawns `caffeinate -i` for the run's lifetime. A full catalog takes ~25 min per site and idle sleep kills the connection. This holds an awake Mac awake; it cannot rescue one that is asleep.
 4. **Per site, in order:** collect, toggle, verify.
 5. **Collect.** Scrapes the live catalogue for that site's link pattern. Reserved and sold are marked skipped.
 6. **Toggle.** Per listing: open edit form, read description, flip trailing period, save.
@@ -52,6 +52,8 @@ All take the venv interpreter: `.venv/bin/python bump.py …`
 9. **Report.** One email covering every site, exits 0 (clean), 1 (some failures), or 2 (fatal).
 
 **Site quirks are config, not special cases.** Vinted's edit form holds two textareas, so its section names the description one rather than trusting `.first`. Its cards hang off a `data-testid` instead of an `<article>`, and its grid renders lazily, so a run scrolls the wardrobe before reading it. Links matching the pattern but carrying no id, like Vinted's `/items/new`, are dropped.
+
+**A sleeping Mac aborts the run instead of limping.** After each listing the run compares the wall clock against the monotonic clock. Only a suspended process sees those two diverge, so a gap over a minute is proof the Mac slept rather than the step being slow. The run stops and says so.
 
 **One site failing does not stop the others.** A site that will not load, or whose session expired, records its own `failed` line and the run moves to the next. Only a dead browser aborts everything.
 
@@ -151,22 +153,17 @@ cp com.enrigle.wallabump.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.enrigle.wallabump.plist
 ```
 
-### 8. Wake the Mac for it
+### 8. Do not bother scheduling a wake
 
-```bash
-sudo pmset repeat wakeorpoweron WS 09:55:00
-pmset -g sched                            # confirm
-```
+There is deliberately no `pmset` wake here, and adding one back would make things worse rather than better.
 
-`W` = Wednesday, `S` = Saturday, five minutes before launchd fires.
+**A scheduled wake on battery is a DarkWake.** macOS gives the machine a few seconds of background CPU and then puts it straight back to sleep. A 50-minute catalogue edit cannot run in four-second slices. This was observed, not assumed: a morning run got one DarkWake every sixteen minutes and spent ninety minutes producing nothing.
 
-**Three constraints:**
+The schedule is 21:55 instead, because a laptop is usually open and genuinely awake in the evening. When it is awake, `caffeinate -i` holds it through the run and no power management is involved at all.
 
-- macOS allows **one** repeating power-event pair system-wide. Anything else that later runs `pmset repeat` silently replaces this.
-- Scheduled wake with the **lid closed requires AC power**. On battery with the lid shut the run does not happen; launchd fires the missed job on next wake.
-- The Mac must be logged in to your user session when it wakes: launchd agents and Chrome only run inside a logged-in GUI session.
+**If the Mac is asleep at 21:55, nothing runs and nothing breaks.** launchd fires the missed job on the next wake. There is no state file, so whenever it does run it reads the live descriptions and covers everything.
 
-Skip this step entirely if the Mac is usually awake at 10:00. launchd runs a missed job on the next wake by itself.
+The one hard requirement: the Mac must be logged in to your user session. launchd agents and Chrome only run inside a logged-in GUI session.
 
 ---
 
@@ -218,7 +215,9 @@ Both sites are told which badge words mean "leave it alone". That was verified o
 | `Site 'x' is missing: …` | `sites.toml` section is incomplete. | Add the named keys. |
 | Every item `failed` | Wallapop redesigned; selectors stale. | Run `probe`, see below. Budget ~15 min. |
 | Run hangs at startup, no log | macOS privacy dialog waiting offscreen. | Find the dialog, click Allow. Once only. |
-| `Browser connection lost mid-run` | Chrome died or Mac slept. | Re-run. `caffeinate` should prevent the sleep case. |
+| `Browser connection lost mid-run` | Chrome died or Mac slept. | Re-run. `caffeinate` covers idle sleep while the Mac is awake. |
+| `Mac slept for N min mid-run` | The Mac was asleep or on a DarkWake. Usually battery plus a closed lid. | Nothing to fix. The next run covers every listing. |
+| `CDP handshake did not finish` | Chrome answered but the Mac was mid-wake. | Re-run while the Mac is awake. Not a login problem. |
 | Many `unverified` | Save button selector matches wrong control. | Check `SAVE_CONTROL` against a `probe` dump. |
 
 ### When selectors break

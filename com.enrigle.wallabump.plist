@@ -16,18 +16,23 @@
     <key>WorkingDirectory</key>
     <string>/Users/enrigle/Documents/code/wallapop</string>
 
-    <!-- Wednesday (3) and Saturday (6) at 10:00. pmset wakes the Mac at 09:55. -->
+    <!-- Thursday (4) and Sunday (0) at 21:55, local time.
+
+         Evening on purpose: a laptop is usually open and genuinely awake then.
+         A morning slot relied on a pmset scheduled wake, which on battery only
+         produces a DarkWake - a few seconds of CPU before the machine sleeps
+         again - and that is not enough to edit a catalog. -->
     <key>StartCalendarInterval</key>
     <array>
         <dict>
-            <key>Weekday</key><integer>3</integer>
-            <key>Hour</key><integer>10</integer>
-            <key>Minute</key><integer>0</integer>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>21</integer>
+            <key>Minute</key><integer>55</integer>
         </dict>
         <dict>
-            <key>Weekday</key><integer>6</integer>
-            <key>Hour</key><integer>10</integer>
-            <key>Minute</key><integer>0</integer>
+            <key>Weekday</key><integer>0</integer>
+            <key>Hour</key><integer>21</integer>
+            <key>Minute</key><integer>55</integer>
         </dict>
     </array>
 
