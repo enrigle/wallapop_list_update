@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import plistlib
 import random
 import re
 import smtplib
@@ -40,6 +41,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -61,6 +63,10 @@ HOME_DIR = Path.home() / ".wallapop-bump"
 PROFILE_DIR = HOME_DIR / "chrome-profile"
 LOG_FILE = HOME_DIR / "bump.log"
 SITES_FILE = Path(__file__).resolve().parent / "sites.toml"
+
+PLIST_NAME = "com.enrigle.wallabump.plist"
+INSTALLED_PLIST = Path.home() / "Library" / "LaunchAgents" / PLIST_NAME
+REPO_PLIST = Path(__file__).resolve().parent / PLIST_NAME
 
 KEYCHAIN_SERVICE = "wallabump-gmail"
 
@@ -128,6 +134,87 @@ def describe(updated: str) -> str:
     """
     direction = "added" if updated.endswith(MARKER) else "removed"
     return f"{direction} {MARKER!r} → …{updated[-20:]!r}"
+
+
+def human_delta(seconds: float) -> str:
+    """A rough "in 6h 58m" for a future gap. Days once it passes 24 hours."""
+    if seconds < 0:
+        return "overdue"
+    minutes = int(seconds // 60)
+    days, minutes = divmod(minutes, 1440)
+    hours, minutes = divmod(minutes, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def last_run(log_text: str) -> tuple[str, str] | None:
+    """The timestamp and summary of the most recent finished run, if any.
+
+    Reads the log's own "Done — Wallabump: ..." line rather than keeping a
+    state file, so status cannot disagree with what actually happened.
+    """
+    found = None
+    for line in log_text.splitlines():
+        match = re.match(
+            r"^(\d{4}-\d\d-\d\d \d\d:\d\d):\d\d[,.]\d+\s+\w+\s+Done — (.+)$", line
+        )
+        if match:
+            found = (match.group(1), match.group(2).strip())
+    return found
+
+
+def schedule_entries(plist_path: Path) -> list[dict[str, int]]:
+    """The StartCalendarInterval entries, always as a list."""
+    if not plist_path.exists():
+        return []
+    try:
+        with plist_path.open("rb") as handle:
+            data = plistlib.load(handle)
+    except (plistlib.InvalidFileException, OSError, ValueError):
+        return []
+    raw = data.get("StartCalendarInterval")
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return [entry for entry in raw if isinstance(entry, dict)]
+    return []
+
+
+def next_fire(entries: list[dict[str, int]], now: datetime) -> datetime | None:
+    """Earliest moment after `now` that any entry fires.
+
+    launchd numbers Sunday as 0 (and accepts 7); Python's isoweekday makes it 7.
+    An entry with no Weekday fires every day. An entry without both Hour and
+    Minute is skipped rather than guessed at.
+    """
+    best: datetime | None = None
+    for day_offset in range(8):
+        day = (now + timedelta(days=day_offset)).date()
+        for entry in entries:
+            if "Hour" not in entry or "Minute" not in entry:
+                continue
+            weekday = entry.get("Weekday")
+            if weekday is not None:
+                wanted = 7 if weekday in (0, 7) else weekday
+                if day.isoweekday() != wanted:
+                    continue
+            # launchd fires on local wall-clock time. Inheriting tzinfo from
+            # `now` keeps the comparison valid whether the caller passed a
+            # naive local datetime or an aware one.
+            moment = datetime(
+                day.year,
+                day.month,
+                day.day,
+                entry["Hour"],
+                entry["Minute"],
+                tzinfo=now.tzinfo,
+            )
+            if moment > now and (best is None or moment < best):
+                best = moment
+    return best
 
 
 # --- Site configuration -------------------------------------------------------
@@ -729,6 +816,67 @@ def login(sites: list[Site]) -> int:
     return 0
 
 
+def status(sites: list[Site]) -> int:
+    """Report whether each site is still signed in, without editing anything.
+
+    Exits 0 when every site is reachable and signed in, 1 otherwise, so it can
+    be used as a check rather than only read by eye.
+    """
+    ensure_dirs()
+    was_running = cdp_reachable()
+    log.info(
+        "Chrome    %s",
+        f"running on {CDP_URL}" if was_running else "not running (starting it)",
+    )
+
+    signed_out: list[str] = []
+    with sync_playwright() as playwright:
+        browser = attach(playwright, sites[0].catalog_url)
+        page = browser.contexts[0].new_page()
+        try:
+            for site in sites:
+                page.goto(site.catalog_url, wait_until="domcontentloaded")
+                if not is_logged_in(page, site):
+                    log.info("%-9s signed OUT — run: python bump.py login", site.name)
+                    signed_out.append(site.name)
+                    continue
+                # Same collector the run uses, so the count cannot disagree
+                # with what a real run would find.
+                log.info(
+                    "%-9s signed in  (%d listings)", site.name, len(collect(page, site))
+                )
+        finally:
+            page.close()
+
+    previous = (
+        last_run(LOG_FILE.read_text(encoding="utf-8")) if LOG_FILE.exists() else None
+    )
+    log.info("")
+    if previous is None:
+        log.info("Last run  never")
+    else:
+        log.info("Last run  %s  %s", previous[0], previous[1])
+
+    plist = INSTALLED_PLIST if INSTALLED_PLIST.exists() else REPO_PLIST
+    entries = schedule_entries(plist)
+    # Local time on purpose: launchd fires on the wall clock, so an aware
+    # local datetime is what the schedule actually means.
+    now = datetime.now().astimezone()
+    upcoming = next_fire(entries, now)
+    if upcoming is None:
+        log.info("Next run  no schedule found in %s", plist)
+    else:
+        log.info(
+            "Next run  %s  (in %s)",
+            upcoming.strftime("%a %H:%M"),
+            human_delta((upcoming - now).total_seconds()),
+        )
+        if not INSTALLED_PLIST.exists():
+            log.info("          NOT INSTALLED — nothing will fire. Copy the plist.")
+
+    return 1 if signed_out else 0
+
+
 def probe(sites: list[Site]) -> int:
     """Dump each catalog page so selectors can be fixed after a redesign."""
     ensure_dirs()
@@ -756,7 +904,7 @@ def probe(sites: list[Site]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "login", "probe"])
+    parser.add_argument("command", choices=["run", "login", "probe", "status"])
     parser.add_argument(
         "--publish",
         action="store_true",
@@ -790,6 +938,8 @@ def main(argv: list[str] | None = None) -> int:
         return login(chosen)
     if args.command == "probe":
         return probe(chosen)
+    if args.command == "status":
+        return status(chosen)
 
     log.info(
         "Starting run (sites=%s, publish=%s, limit=%s)",

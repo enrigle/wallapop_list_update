@@ -11,6 +11,7 @@ No LLM, no API key, no cloud. One dependency (`playwright`), driving your real C
 ## Contents
 
 - [Commands](#commands) — cheat sheet
+- [Checking on it](#checking-on-it) — is it still signed in?
 - [How it works](#how-it-works) — the run, start to finish
 - [Why a separate Chrome](#why-a-separate-chrome) — the one non-obvious design choice
 - [Setup](#setup) — eight steps, once
@@ -25,6 +26,7 @@ No LLM, no API key, no cloud. One dependency (`playwright`), driving your real C
 
 | Command | Does |
 | --- | --- |
+| `bump.py status` | Is everything signed in, and when does it next run? Changes nothing. |
 | `bump.py login` | Open Chrome, sign in, confirm session. Once, and after `RE-AUTH NEEDED`. |
 | `bump.py run` | Dry run. Reads everything, changes nothing. |
 | `bump.py run --publish` | The real thing. What launchd runs. |
@@ -36,6 +38,29 @@ No LLM, no API key, no cloud. One dependency (`playwright`), driving your real C
 `--site` takes any section name from `sites.toml`, or `all`, the default. An unknown name exits 2 and lists what is configured.
 
 All take the venv interpreter: `.venv/bin/python bump.py …`
+
+---
+
+## Checking on it
+
+```bash
+.venv/bin/python bump.py status
+```
+
+```text
+Chrome    running on http://127.0.0.1:9222
+wallapop  signed in  (22 listings)
+vinted    signed in  (20 listings)
+
+Last run  2026-09-10 14:55  Wallabump: 2 ok, 0 skipped, 0 unverified, 0 failed
+Next run  Thu 21:55  (in 6h 35m)
+```
+
+Edits nothing. Takes about 30 seconds, because it counts listings with the same collector a real run uses, so the numbers cannot disagree with what a run would see.
+
+Exits 0 when every site is signed in, 1 when any is signed out, so it works as a check and not only as something to read. Add `--site vinted` to check one.
+
+Last run comes from the log's own `Done —` line, not a state file. Next run is read from the installed launchd plist, and it says so loudly if that plist is missing, since nothing would fire at all in that case.
 
 ---
 
@@ -260,6 +285,7 @@ To switch to word pair instead (e.g. two alternating closing sentences), change 
 | File | Holds |
 | --- | --- |
 | `bump.py` | Everything. Shared constants at top, pure logic, then browser I/O. |
+| `com.enrigle.wallabump.plist` (installed copy) | What `status` reads to say when the next run is. |
 | `sites.toml` | Per-site URLs and selectors. Edit this when a site redesigns. |
 | `test_bump.py` | Edge cases for the pure functions and the config loader. |
 | `com.enrigle.wallabump.plist` | launchd schedule. Copy to `~/Library/LaunchAgents/`. |

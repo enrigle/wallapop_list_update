@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from bump import MARKER, Site, describe, load_sites, slept_seconds, toggle
+from bump import (
+    MARKER,
+    Site,
+    describe,
+    human_delta,
+    last_run,
+    load_sites,
+    next_fire,
+    schedule_entries,
+    slept_seconds,
+    toggle,
+)
 
 
 @pytest.mark.parametrize("desc", [None, "", "   ", "\n\t  \n"])
@@ -267,3 +279,107 @@ def test_backwards_drift_never_returns_a_negative() -> None:
     # A wall clock nudged forward by NTP must not read as negative sleep.
     mark = (time.time() + 30.0, time.monotonic())
     assert slept_seconds(mark) == 0.0
+
+
+# --- status reporting ---------------------------------------------------------
+
+
+def at(year: int, month: int, day: int, hour: int, minute: int) -> datetime:
+    """A fixed-offset datetime. next_fire() inherits tzinfo from the caller,
+    so any single zone makes these cases deterministic."""
+    return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+
+
+# Thursday and Sunday at 21:55, matching the shipped plist.
+SCHEDULE = [
+    {"Weekday": 4, "Hour": 21, "Minute": 55},
+    {"Weekday": 0, "Hour": 21, "Minute": 55},
+]
+
+
+def test_next_fire_finds_tonight_when_it_is_still_ahead() -> None:
+    # Thursday afternoon: tonight's 21:55 is the next one.
+    now = at(2026, 9, 10, 14, 57)
+    assert next_fire(SCHEDULE, now) == at(2026, 9, 10, 21, 55)
+
+
+def test_next_fire_rolls_to_sunday_once_thursday_has_passed() -> None:
+    # Thursday 22:30, just after the run: Sunday is next.
+    now = at(2026, 9, 10, 22, 30)
+    assert next_fire(SCHEDULE, now) == at(2026, 9, 13, 21, 55)
+
+
+def test_next_fire_treats_launchd_sunday_seven_like_zero() -> None:
+    # launchd accepts both 0 and 7 for Sunday; they must behave identically.
+    now = at(2026, 9, 10, 22, 30)
+    sunday_as_seven = [{"Weekday": 7, "Hour": 21, "Minute": 55}]
+    assert next_fire(sunday_as_seven, now) == at(2026, 9, 13, 21, 55)
+
+
+def test_next_fire_is_exclusive_of_the_current_minute() -> None:
+    # Firing "now" is in the past for scheduling purposes, not the next run.
+    now = at(2026, 9, 10, 21, 55)
+    assert next_fire(SCHEDULE, now) == at(2026, 9, 13, 21, 55)
+
+
+def test_an_entry_without_a_weekday_fires_daily() -> None:
+    now = at(2026, 9, 10, 14, 0)
+    assert next_fire([{"Hour": 21, "Minute": 55}], now) == at(2026, 9, 10, 21, 55)
+
+
+@pytest.mark.parametrize("entries", [[], [{"Weekday": 4}], [{"Hour": 21}]])
+def test_next_fire_returns_none_rather_than_guessing(
+    entries: list[dict[str, int]],
+) -> None:
+    # An incomplete entry must not be filled in with an invented hour.
+    assert next_fire(entries, at(2026, 9, 10, 14, 0)) is None
+
+
+def test_schedule_entries_reads_the_shipped_plist() -> None:
+    entries = schedule_entries(Path("com.enrigle.wallabump.plist"))
+    assert len(entries) == 2
+    assert {e["Hour"] for e in entries} == {21}
+    assert {e["Weekday"] for e in entries} == {0, 4}
+
+
+def test_schedule_entries_on_a_missing_file_is_empty() -> None:
+    assert schedule_entries(Path("no-such.plist")) == []
+
+
+def test_schedule_entries_on_a_corrupt_file_is_empty(tmp_path: Path) -> None:
+    # A damaged plist must not crash a status check.
+    bad = tmp_path / "bad.plist"
+    bad.write_text("this is not a plist", encoding="utf-8")
+    assert schedule_entries(bad) == []
+
+
+def test_last_run_takes_the_most_recent_done_line() -> None:
+    log = (
+        "2026-09-06 17:47:04,302 INFO     Done — Wallabump: 4 ok, 0 failed\n"
+        "2026-09-10 14:40:12,001 INFO     Starting run (sites=wallapop)\n"
+        "2026-09-10 14:41:55,900 INFO     Done — Wallabump: 2 ok, 0 failed\n"
+    )
+    assert last_run(log) == ("2026-09-10 14:41", "Wallabump: 2 ok, 0 failed")
+
+
+def test_last_run_on_a_log_with_no_finished_run() -> None:
+    assert last_run("2026-09-10 14:40:12,001 INFO     Starting run\n") is None
+
+
+def test_last_run_on_an_empty_log() -> None:
+    assert last_run("") is None
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0, "0m"),
+        (90, "1m"),
+        (3600, "1h 00m"),
+        (25140, "6h 59m"),
+        (259200, "3d 0h"),
+        (-60, "overdue"),
+    ],
+)
+def test_human_delta(seconds: float, expected: str) -> None:
+    assert human_delta(seconds) == expected
