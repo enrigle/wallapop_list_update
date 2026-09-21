@@ -8,14 +8,20 @@ from pathlib import Path
 
 import pytest
 
+import bump
 from bump import (
+    BUMP,
+    CONTROL,
     MARKER,
     Site,
     describe,
+    group_for,
     human_delta,
     last_run,
     load_sites,
     next_fire,
+    page_targets_to_activate,
+    parse_counter,
     schedule_entries,
     slept_seconds,
     toggle,
@@ -281,6 +287,168 @@ def test_backwards_drift_never_returns_a_negative() -> None:
     assert slept_seconds(mark) == 0.0
 
 
+# --- Stats counter parsing ----------------------------------------------------
+
+
+def test_a_plain_counter_is_read() -> None:
+    assert parse_counter("78") == 78
+
+
+def test_counter_ignores_surrounding_whitespace_and_icon_text() -> None:
+    # The cell holds an inline SVG then the number, so innerText carries newlines.
+    assert parse_counter("\n  34\n") == 34
+
+
+@pytest.mark.parametrize("text", ["1.234", "1,234"])
+def test_thousands_separators_are_stripped(text: str) -> None:
+    # es-ES writes 1.234; a naive int() would raise and lose the whole snapshot.
+    assert parse_counter(text) == 1234
+
+
+@pytest.mark.parametrize("text", ["", "   ", "—", "-", "n/a"])
+def test_unreadable_counters_are_zero_not_crashes(text: str) -> None:
+    assert parse_counter(text) == 0
+
+
+def test_zero_reads_as_zero() -> None:
+    assert parse_counter("0") == 0
+
+
+# --- Experiment A/B split -----------------------------------------------------
+
+
+def test_group_is_stable_for_the_same_id() -> None:
+    # The control group only means anything if membership survives re-runs.
+    assert group_for("mesa-de-roble-123456") == group_for("mesa-de-roble-123456")
+
+
+def test_both_groups_are_used() -> None:
+    ids = [f"item-{n}" for n in range(200)]
+    groups = {group_for(i) for i in ids}
+    assert groups == {BUMP, CONTROL}
+
+
+def test_the_split_is_roughly_even() -> None:
+    # Not exactly half, but a wild skew would gut the comparison.
+    ids = [f"item-{n}" for n in range(400)]
+    bumped = sum(1 for i in ids if group_for(i) == BUMP)
+    assert 150 < bumped < 250
+
+
+def test_an_empty_id_lands_in_the_control_group() -> None:
+    # No id means no reliable edit form, so it must never count as bumped.
+    assert group_for("") == CONTROL
+
+
+def test_real_id_shapes_from_both_sites_are_handled() -> None:
+    for item_id in ("mesa-de-roble-123456", "9873738631", "kimono-judo-7-8-anos"):
+        assert group_for(item_id) in (BUMP, CONTROL)
+
+
+def test_accented_and_unicode_ids_do_not_crash() -> None:
+    assert group_for("bolso-pañalera-y-portachupetes") in (BUMP, CONTROL)
+
+
+# --- Chrome lifecycle ---------------------------------------------------------
+
+
+def test_a_chrome_that_was_already_running_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Someone else's browser: closing it would take their tabs with it.
+    quit_calls: list[object] = []
+    monkeypatch.setattr(bump, "ensure_chrome", lambda url: None)
+    monkeypatch.setattr(bump, "quit_chrome", quit_calls.append)
+    with bump.owned_chrome("https://example.test"):
+        pass
+    assert quit_calls == []
+
+
+def test_a_chrome_this_command_opened_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Left running, it becomes the Dock's Chrome and the everyday browser.
+    launched = object()
+    quit_calls: list[object] = []
+    monkeypatch.setattr(bump, "ensure_chrome", lambda url: launched)
+    monkeypatch.setattr(bump, "quit_chrome", quit_calls.append)
+    with bump.owned_chrome("https://example.test"):
+        pass
+    assert quit_calls == [launched]
+
+
+def test_it_is_closed_even_when_the_command_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launched = object()
+    quit_calls: list[object] = []
+    monkeypatch.setattr(bump, "ensure_chrome", lambda url: launched)
+    monkeypatch.setattr(bump, "quit_chrome", quit_calls.append)
+    with pytest.raises(RuntimeError), bump.owned_chrome("https://example.test"):
+        raise RuntimeError("run blew up")
+    assert quit_calls == [launched]
+
+
+# --- Thawing frozen tabs before the CDP handshake -----------------------------
+
+CATALOG = "https://es.wallapop.com/app/catalog/published"
+
+
+def target(kind: str, tid: str, url: str = "") -> dict[str, str]:
+    return {"type": kind, "id": tid, "url": url}
+
+
+def test_only_tabs_are_activated() -> None:
+    # Service workers and iframes are not tabs; activating them is meaningless.
+    targets = [
+        target("service_worker", "sw1", "chrome-extension://x/background.js"),
+        target("iframe", "if1", "https://accounts.google.com/RotateCookiesPage"),
+        target("page", "p1", "https://mail.google.com/mail/u/0/"),
+    ]
+    assert page_targets_to_activate(targets, CATALOG) == ["p1"]
+
+
+def test_our_catalog_tab_is_activated_last() -> None:
+    # Last activated is left in front, so a run must not park on someone's mail.
+    targets = [
+        target("page", "ours", CATALOG),
+        target("page", "mail", "https://mail.google.com/mail/u/0/"),
+    ]
+    assert page_targets_to_activate(targets, CATALOG) == ["mail", "ours"]
+
+
+def test_other_tabs_keep_their_order() -> None:
+    targets = [
+        target("page", "a", "https://claude.ai/chat/1"),
+        target("page", "b", "https://www.linkedin.com/in/jorge1/"),
+        target("page", "ours", CATALOG + "?from=x"),
+    ]
+    assert page_targets_to_activate(targets, CATALOG) == ["a", "b", "ours"]
+
+
+def test_no_catalog_tab_still_activates_the_rest() -> None:
+    # First run of the day: Chrome is up but has never opened the catalog.
+    targets = [target("page", "a", "https://chatgpt.com/c/1")]
+    assert page_targets_to_activate(targets, CATALOG) == ["a"]
+
+
+def test_an_empty_target_list_is_not_an_error() -> None:
+    assert page_targets_to_activate([], CATALOG) == []
+
+
+def test_targets_missing_keys_are_skipped_not_crashed() -> None:
+    # /json/list is whatever Chrome sends; a target without an id cannot be
+    # activated and must not take the run down with a KeyError.
+    targets = [
+        {"type": "page"},
+        {"id": "no-type"},
+        {},
+        target("page", "", "https://example.test"),
+        target("page", "good", "https://example.test"),
+    ]
+    assert page_targets_to_activate(targets, CATALOG) == ["good"]
+
+
 # --- status reporting ---------------------------------------------------------
 
 
@@ -338,7 +506,8 @@ def test_next_fire_returns_none_rather_than_guessing(
 def test_schedule_entries_reads_the_shipped_plist() -> None:
     entries = schedule_entries(Path("com.enrigle.wallabump.plist"))
     assert len(entries) == 2
-    assert {e["Hour"] for e in entries} == {21}
+    assert {e["Hour"] for e in entries} == {22}
+    assert {e["Minute"] for e in entries} == {25}
     assert {e["Weekday"] for e in entries} == {0, 4}
 
 

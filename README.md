@@ -1,6 +1,6 @@
 # Wallabump
 
-Twice week (Thu + Sun, 21:55), toggle one char in every active listing so items resurface in feeds. Emails receipt after every run.
+Twice week (Thu + Sun, 22:25), toggle one char in every active listing so items resurface in feeds. Emails receipt after every run.
 
 Two sites configured: **Wallapop** and **Vinted**. Sites are config, not code — `sites.toml` holds one section per marketplace, so a third is a config entry.
 
@@ -17,6 +17,7 @@ No LLM, no API key, no cloud. One dependency (`playwright`), driving your real C
 - [Setup](#setup) — eight steps, once
 - [Daily life](#daily-life) — reading the email
 - [Troubleshooting](#troubleshooting) — symptom, cause, fix
+- [Measuring whether it works](#measuring-whether-it-works) — the bump-vs-control experiment
 - [What it edits](#what-it-edits) — and what it refuses to
 - [Development](#development)
 
@@ -33,6 +34,8 @@ No LLM, no API key, no cloud. One dependency (`playwright`), driving your real C
 | `bump.py run --publish --limit 1` | Real, one listing per site. Smoke test. |
 | `bump.py run --site vinted` | One site instead of all. |
 | `bump.py probe` | Dump catalog HTML when selectors break. |
+| `bump.py stats` | Snapshot Wallapop's per-listing views, chats and favourites to `~/.wallapop-bump/stats/`. Read-only. |
+| `bump.py run --publish --experiment` | Bump only half the catalog; the other half is the control group. |
 | `-v` | Debug logging on any of the above. |
 
 `--site` takes any section name from `sites.toml`, or `all`, the default. An unknown name exits 2 and lists what is configured.
@@ -53,7 +56,7 @@ wallapop  signed in  (22 listings)
 vinted    signed in  (20 listings)
 
 Last run  2026-09-10 14:55  Wallabump: 2 ok, 0 skipped, 0 unverified, 0 failed
-Next run  Thu 21:55  (in 6h 35m)
+Next run  Thu 22:25  (in 6h 35m)
 ```
 
 Edits nothing. Takes about 30 seconds, because it counts listings with the same collector a real run uses, so the numbers cannot disagree with what a run would see.
@@ -67,7 +70,7 @@ Last run comes from the log's own `Done —` line, not a state file. Next run is
 ## How it works
 
 1. **Load config.** Reads `sites.toml`. A missing key names the site and the key, and exits 2 rather than running half-configured.
-2. **Attach.** Checks `127.0.0.1:9222`. Dead → launches plain Chrome on the saved profile, waits up to 15s.
+2. **Attach.** Checks `127.0.0.1:9222`. Dead → launches plain Chrome on the saved profile, waits up to 15s. Then thaws every open tab before connecting, see below.
 3. **Stay awake.** Spawns `caffeinate -i` for the run's lifetime. A full catalog takes ~25 min per site and idle sleep kills the connection. This holds an awake Mac awake; it cannot rescue one that is asleep.
 4. **Per site, in order:** collect, toggle, verify.
 5. **Collect.** Scrapes the live catalogue for that site's link pattern. Reserved and sold are marked skipped.
@@ -79,6 +82,10 @@ Last run comes from the log's own `Done —` line, not a state file. Next run is
 **Site quirks are config, not special cases.** Vinted's edit form holds two textareas, so its section names the description one rather than trusting `.first`. Its cards hang off a `data-testid` instead of an `<article>`, and its grid renders lazily, so a run scrolls the wardrobe before reading it. Links matching the pattern but carrying no id, like Vinted's `/items/new`, are dropped.
 
 **A sleeping Mac aborts the run instead of limping.** After each listing the run compares the wall clock against the monotonic clock. Only a suspended process sees those two diverge, so a gap over a minute is proof the Mac slept rather than the step being slow. The run stops and says so.
+
+**Frozen tabs are thawed before attaching.** Chrome freezes tabs left idle in the background, and a frozen tab answers no CDP command ever — not slowly, never. Attaching adopts *every* tab in the browser and waits for each one to report in, so one frozen tab stalls the whole handshake until it times out, while the browser itself answers in milliseconds. That is why a run can fail against a Chrome that is plainly alive. Each run therefore activates every tab over the plain HTTP endpoint first, which thaws them, and ends on the catalog tab so the browser is not left parked on your mail. Chrome is also launched with backgrounding switched off, so a browser this script started does not freeze its tabs in the first place.
+
+**The bot's Chrome closes when the command ends.** Any command that had to open Chrome shuts it down again afterwards, cleanly, so the cookies are saved for next time. A Chrome that was already running is left alone. This matters more than it looks: while the bot's Chrome is running, clicking Chrome in the Dock opens *that* one, not your normal Chrome. Left running between runs, it quietly became the everyday browser for eleven days — and every personal tab in it was one more tab to freeze and stall the next handshake.
 
 **One site failing does not stop the others.** A site that will not load, or whose session expired, records its own `failed` line and the run moves to the next. Only a dead browser aborts everything.
 
@@ -94,7 +101,7 @@ Wallapop bot protection forces re-login screen on any *Playwright-launched* Chro
 
 Workaround: script starts plain, non-automated Chrome on own profile (`~/.wallapop-bump/chrome-profile/`), or reuses running one, attaches over Chrome DevTools Protocol (CDP). Plain launch look like human reopening Chrome, so re-login trigger no fire.
 
-**This means:** quitting that Chrome or rebooting Mac fine. Next run relaunches from saved profile. If Wallapop asks login anyway, run emails `RE-AUTH NEEDED`; run `bump.py login` again.
+**This means:** quitting that Chrome or rebooting Mac fine. Each command opens it from the saved profile and closes it when done. Browse in your normal Chrome, not this one. If Wallapop asks login anyway, run emails `RE-AUTH NEEDED`; run `bump.py login` again.
 
 **Security note:** the debugging port (`127.0.0.1:9222`) only accepts local connections, but any other process on this Mac could in principle attach to it too while Chrome is running with it open. Acceptable on a personal machine, worth knowing.
 
@@ -184,9 +191,9 @@ There is deliberately no `pmset` wake here, and adding one back would make thing
 
 **A scheduled wake on battery is a DarkWake.** macOS gives the machine a few seconds of background CPU and then puts it straight back to sleep. A 50-minute catalogue edit cannot run in four-second slices. This was observed, not assumed: a morning run got one DarkWake every sixteen minutes and spent ninety minutes producing nothing.
 
-The schedule is 21:55 instead, because a laptop is usually open and genuinely awake in the evening. When it is awake, `caffeinate -i` holds it through the run and no power management is involved at all.
+The schedule is 22:25 instead, because a laptop is usually open and genuinely awake in the evening. When it is awake, `caffeinate -i` holds it through the run and no power management is involved at all.
 
-**If the Mac is asleep at 21:55, nothing runs and nothing breaks.** launchd fires the missed job on the next wake. There is no state file, so whenever it does run it reads the live descriptions and covers everything.
+**If the Mac is asleep at 22:25, nothing runs and nothing breaks.** launchd fires the missed job on the next wake. There is no state file, so whenever it does run it reads the live descriptions and covers everything.
 
 The one hard requirement: the Mac must be logged in to your user session. launchd agents and Chrome only run inside a logged-in GUI session.
 
@@ -242,7 +249,7 @@ Both sites are told which badge words mean "leave it alone". That was verified o
 | Run hangs at startup, no log | macOS privacy dialog waiting offscreen. | Find the dialog, click Allow. Once only. |
 | `Browser connection lost mid-run` | Chrome died or Mac slept. | Re-run. `caffeinate` covers idle sleep while the Mac is awake. |
 | `Mac slept for N min mid-run` | The Mac was asleep or on a DarkWake. Usually battery plus a closed lid. | Nothing to fix. The next run covers every listing. |
-| `CDP handshake did not finish` | Chrome answered but the Mac was mid-wake. | Re-run while the Mac is awake. Not a login problem. |
+| `CDP handshake did not finish` | A tab Chrome froze did not thaw. Every run thaws all tabs first, so this means one stayed stuck. | Quit that Chrome and re-run. Not a login problem, and not the Mac being asleep. |
 | Many `unverified` | Save button selector matches wrong control. | Check `SAVE_CONTROL` against a `probe` dump. |
 
 ### When selectors break
@@ -252,6 +259,24 @@ Both sites are told which badge words mean "leave it alone". That was verified o
 ```
 
 Attaches to running Chrome, dumps `~/.wallapop-bump/probe-<site>.html` per site, reports how many listing links each shows. Fix that site's section in `sites.toml` against the dump — no code change. Expect once or twice year per site.
+
+---
+
+## Measuring whether it works
+
+Nothing had ever tested the premise that an edit resurfaces a listing, so there is a way to check it.
+
+```bash
+.venv/bin/python bump.py stats                        # baseline
+# let two scheduled runs happen with --experiment in the plist
+.venv/bin/python bump.py stats                        # after
+```
+
+`--experiment` splits the catalog in two by a hash of each listing's id: one half is bumped, the other is left alone. The split is stable, so a listing stays in its group as the catalog reorders. Held-back listings show as `skipped  control` in the email.
+
+`stats` writes one CSV per snapshot with each listing's views, chats, favourites and group. Compare how much each group's views grew between snapshots. If the bumped half does not beat the control half, the edit does nothing.
+
+Two caveats. Wallapop labels these numbers "Estadísticas de la semana", so treat them as a rolling figure, not lifetime totals. And with ~23 listings the groups are small and uneven (currently 9 bumped vs 14 held back), so only a large difference means anything.
 
 ---
 
