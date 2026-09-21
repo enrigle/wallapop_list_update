@@ -16,20 +16,25 @@ URL, edit URL, link shape, button words — is read from there, so adding a seco
 marketplace is a config entry, not a code change.
 
 Usage:
-    python bump.py login              # one-time: opens Chrome, you sign in, leave it running
+    python bump.py login              # one-time: opens Chrome, you sign in, it closes after
     python bump.py run                # dry run (default): changes nothing
     python bump.py run --publish      # the real thing
     python bump.py run --site vinted  # one site instead of all of them
     python bump.py probe --site vinted  # dump a catalog page for selector debugging
+    python bump.py stats              # snapshot per-listing views/chats/favourites
+    python bump.py run --publish --experiment  # bump half, hold half as control
 
-If that Chrome is closed or the Mac reboots, the next run relaunches it from
-the saved profile. If Wallapop then asks for a login anyway, you get a
+Each command opens that Chrome if it is not already running and closes it again
+when done, so it never lingers as your everyday browser. If Wallapop then asks for a login anyway, you get a
 RE-AUTH NEEDED email: run `python bump.py login` again.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
+import json
 import logging
 import os
 import plistlib
@@ -40,6 +45,9 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -70,17 +78,33 @@ REPO_PLIST = Path(__file__).resolve().parent / PLIST_NAME
 
 KEYCHAIN_SERVICE = "wallabump-gmail"
 
+# Wallapop-only, and deliberately not in sites.toml: no other configured site
+# exposes per-listing counters, so a config key would be a setting with exactly
+# one possible value. The page is Angular; each listing is one <tsl-item-stats-row>
+# holding three .col-counters in the order the header names them.
+STATS_URL = "https://es.wallapop.com/app/stats"
+STATS_SITE = "wallapop"
+STATS_DIR = HOME_DIR / "stats"
+
 CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CDP_PORT = 9222
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 
-# The handshake happens right after a scheduled wake, when the machine is still
-# coming up. 5s was too tight and reported a live browser as unreachable.
-CDP_TIMEOUT_MS = 30000
+# The handshake waits for every open tab to report in, and a tab that was just
+# nudged awake can take seconds to do so. 30s was enough for 7 tabs and not for
+# 10; the cost of a generous ceiling is only paid when something is wrong.
+CDP_TIMEOUT_MS = 60000
 
 # A suspended process keeps its wall clock but loses monotonic time, so a gap
 # between the two is proof the Mac slept rather than the step being slow.
 SLEEP_DRIFT_SECONDS = 60.0
+
+# A raised tab takes a moment to thaw, and raising the next one puts it straight
+# back in the background, so the activations have to be spaced. Measured thaw
+# across a real 10-tab window: 0.3s to 4.1s, Gmail the slowest. At 1.5s the three
+# slowest tabs were backgrounded mid-wake and stayed frozen, which stalled the
+# handshake — so this sits above the slowest observed, not the average.
+THAW_SECONDS = 5.0
 
 # The edit that resurfaces the listing. Swap for a word pair (e.g. two closing
 # sentences) if a trailing period ever proves unsuitable; nothing else changes.
@@ -324,6 +348,45 @@ def clock_mark() -> tuple[float, float]:
     return time.time(), time.monotonic()
 
 
+# The experiment splits the catalog in two: one half gets bumped, the other is
+# left alone so there is something to compare against. Without a control group,
+# an ordinary quiet week is indistinguishable from the bump doing nothing.
+BUMP = "bump"
+CONTROL = "control"
+
+
+def parse_counter(text: str) -> int:
+    """The number inside a stats counter cell, or 0 when it is not a number.
+
+    The cell carries an icon plus a number, sometimes thousands-separated. A
+    cell that cannot be read must not abort a snapshot of 23 listings, and 0 is
+    the honest reading of "no views recorded" — but note it is indistinguishable
+    from a genuinely unread cell, so a whole column of zeroes means the selector
+    broke, not that nobody looked.
+    """
+    if not text:
+        return 0
+    digits = re.sub(r"[^0-9]", "", text)
+    return int(digits) if digits else 0
+
+
+def group_for(item_id: str) -> str:
+    """Which experiment half a listing belongs to, stably.
+
+    Hashed from the id rather than taken from catalog position, so a listing
+    keeps its group as the catalog reorders — a control group that reshuffles
+    every run measures nothing. sha256 because Python's own hash() is salted
+    per process and would reassign every listing on each run.
+
+    An id-less listing goes to the control group: the run cannot open an edit
+    form for it reliably anyway, so it must not count as bumped.
+    """
+    if not item_id:
+        return CONTROL
+    digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+    return BUMP if int(digest, 16) % 2 == 0 else CONTROL
+
+
 # --- Results ------------------------------------------------------------------
 
 
@@ -469,6 +532,28 @@ _COLLECT_JS = """
 """
 
 
+_STATS_JS = """
+() => {
+  const rows = [...document.querySelectorAll('tsl-item-stats-row')];
+  return rows.map(row => {
+    const link = row.querySelector('a[href*="/item/"]');
+    const text = sel => {
+      const el = row.querySelector(sel);
+      return el ? (el.innerText || '').trim() : '';
+    };
+    return {
+      href: link ? link.href : '',
+      title: text('.title'),
+      price: text('.price'),
+      published: text('.col-date'),
+      counters: [...row.querySelectorAll('.col-counters')]
+                  .map(c => (c.innerText || '').trim()),
+    };
+  });
+}
+"""
+
+
 def ensure_dirs() -> None:
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(HOME_DIR, 0o700)
@@ -580,7 +665,7 @@ def cdp_reachable() -> bool:
         return False
 
 
-def launch_chrome(start_url: str) -> None:
+def launch_chrome(start_url: str) -> subprocess.Popen[bytes]:
     """Start a real, non-automated Chrome with its debugging port open.
 
     No `--enable-automation`, no Playwright involved in the launch — Chrome
@@ -591,13 +676,19 @@ def launch_chrome(start_url: str) -> None:
     terminal that launched it.
     """
     ensure_dirs()
-    subprocess.Popen(
+    return subprocess.Popen(
         [
             CHROME_BINARY,
             f"--user-data-dir={PROFILE_DIR}",
             f"--remote-debugging-port={CDP_PORT}",
             "--no-first-run",
             "--no-default-browser-check",
+            # Keep background tabs running. Chrome freezes long-idle ones, and a
+            # frozen tab stalls every future CDP handshake (see wake_targets).
+            # These three are what Playwright passes its own Chrome.
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
             start_url,
         ],
         start_new_session=True,
@@ -606,32 +697,137 @@ def launch_chrome(start_url: str) -> None:
     )
 
 
-def ensure_chrome(start_url: str, wait_seconds: float = 15.0) -> None:
-    """Launch Chrome if the debugging port is dead, then wait for it."""
+def ensure_chrome(
+    start_url: str, wait_seconds: float = 15.0
+) -> subprocess.Popen[bytes] | None:
+    """Launch Chrome if the debugging port is dead, then wait for it.
+
+    Returns the process when this call launched it, None when a Chrome was
+    already answering — that one belongs to whoever started it.
+    """
     if cdp_reachable():
-        return
+        return None
     log.info("Chrome not running; launching it from the saved profile.")
-    launch_chrome(start_url)
+    process = launch_chrome(start_url)
     deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         if cdp_reachable():
             time.sleep(2)  # let the first tab settle before attaching
-            return
+            return process
         time.sleep(0.5)
+    quit_chrome(process)
     raise RuntimeError(
         f"Launched Chrome but {CDP_URL} never came up within {wait_seconds:.0f}s. "
         "Run: python bump.py login"
     )
 
 
+def quit_chrome(process: subprocess.Popen[bytes]) -> None:
+    """Close a Chrome this script launched, cleanly enough to keep its cookies.
+
+    SIGTERM is Chrome's orderly shutdown: it writes the profile out, so the
+    sessions are there on the next launch. SIGKILL only if it will not go,
+    since that skips the write and earns the next launch a "restore pages?"
+    prompt.
+    """
+    process.terminate()
+    try:
+        process.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        log.warning("Chrome ignored SIGTERM; killing it.")
+        process.kill()
+        process.wait(timeout=10)
+    log.info("Closed the Chrome this run opened.")
+
+
+@contextmanager
+def owned_chrome(start_url: str) -> Iterator[None]:
+    """Chrome for the length of one command, closed afterwards if this opened it.
+
+    Leaving the bot's Chrome running between runs is what turned it into the
+    everyday browser: macOS activates the already-running Chrome on a Dock
+    click, so from its first launch every new window landed in the bot's
+    profile — dragging in the tabs that freeze and stall the CDP handshake. A
+    Chrome that was already running when the command started is left alone.
+    """
+    launched = ensure_chrome(start_url)
+    try:
+        yield
+    finally:
+        if launched is not None:
+            quit_chrome(launched)
+
+
+def page_targets_to_activate(
+    targets: list[dict[str, str]], start_url: str
+) -> list[str]:
+    """Ids of every open tab, with our own catalog tab last.
+
+    Activating a tab raises it, so whichever is activated last is the one left
+    in front. Ending on the catalog tab means a run never parks the browser on
+    somebody's mail. Only `page` targets can be activated; service workers and
+    iframes are not tabs and do not freeze this way.
+    """
+    pages = [t for t in targets if t.get("type") == "page" and t.get("id")]
+    ours = [t["id"] for t in pages if t.get("url", "").startswith(start_url)]
+    return [t["id"] for t in pages if t["id"] not in ours] + ours
+
+
+def wake_targets(start_url: str) -> None:
+    """Thaw every open tab so the CDP handshake can finish.
+
+    Chrome freezes tabs left idle in the background, and a frozen renderer
+    answers no CDP command — not slowly, never. `connect_over_cdp` attaches to
+    every target in the browser and waits for each one to initialise, so a
+    single frozen tab stalls the whole handshake until it times out, with the
+    browser itself perfectly healthy and answering browser-level CDP in
+    milliseconds. Activating a tab thaws it, and the plain HTTP endpoint does
+    that without a websocket.
+
+    Spacing matters: raising a tab backgrounds the previous one, so activating
+    them in a burst thaws only the last. Each one gets THAW_SECONDS to come back
+    before the next is raised. A thawed tab stays thawed once backgrounded
+    again, so the whole browser is awake by the time the handshake starts.
+
+    Best effort throughout: a browser that will not list or thaw its tabs is
+    for `connect_over_cdp` to report, not for this to pre-empt.
+    """
+    try:
+        with urllib.request.urlopen(f"{CDP_URL}/json/list", timeout=5) as response:
+            targets = json.load(response)
+    except (OSError, ValueError):
+        log.warning("Could not list Chrome's tabs to thaw them; attaching anyway.")
+        return
+    target_ids = page_targets_to_activate(targets, start_url)
+    thawed = 0
+    for target_id in target_ids:
+        try:
+            urllib.request.urlopen(
+                f"{CDP_URL}/json/activate/{target_id}", timeout=5
+            ).close()
+        except OSError:
+            continue
+        thawed += 1
+        time.sleep(THAW_SECONDS)
+    log.info("Thawed %d of %d open tabs before attaching.", thawed, len(target_ids))
+
+
 def attach(playwright: Playwright, start_url: str) -> Browser:
     """Connect to the already-running Chrome over CDP.
 
-    The timeout is generous because the handshake follows a wake: five seconds
-    was enough to fail on a machine that had just come back from sleep, while
-    the port itself was answering perfectly well.
+    The timeout is generous because a thawing tab takes a few seconds to answer
+    its first command, and the handshake waits for every open tab in turn.
     """
     ensure_chrome(start_url)
+    wake_targets(start_url)
+    try:
+        return playwright.chromium.connect_over_cdp(CDP_URL, timeout=CDP_TIMEOUT_MS)
+    except PlaywrightError:
+        # One straggler that woke too slowly is the common case, and by now it
+        # has had the whole timeout to wake. A second pass re-raises whatever is
+        # still frozen and costs one extra attempt on a twice-weekly run.
+        log.warning("CDP handshake stalled; thawing tabs again and retrying once.")
+        wake_targets(start_url)
     try:
         return playwright.chromium.connect_over_cdp(CDP_URL, timeout=CDP_TIMEOUT_MS)
     except PlaywrightError as exc:
@@ -641,8 +837,8 @@ def attach(playwright: Playwright, start_url: str) -> Browser:
         if cdp_reachable():
             raise RuntimeError(
                 f"Chrome answered at {CDP_URL} but the CDP handshake did not "
-                f"finish within {CDP_TIMEOUT_MS // 1000}s. The Mac was probably "
-                "asleep or mid-wake."
+                f"finish within {CDP_TIMEOUT_MS // 1000}s, twice. A tab Chrome "
+                "froze would not thaw. Quit that Chrome and re-run to clear it."
             ) from exc
         raise RuntimeError(
             f"Chrome with remote debugging isn't reachable at {CDP_URL}. "
@@ -688,7 +884,12 @@ def collect(page: Page, site: Site) -> list[Item]:
 
 
 def bump_site(
-    page: Page, browser: Browser, site: Site, publish: bool, limit: int
+    page: Page,
+    browser: Browser,
+    site: Site,
+    publish: bool,
+    limit: int,
+    experiment: bool = False,
 ) -> tuple[list[Result], str]:
     """Bump one site. Returns its results and a fatal message, "" when fine.
 
@@ -713,6 +914,22 @@ def bump_site(
             results.append(Result(site.name, item.title, "skipped", state))
 
     active = [i for i in items if not i.reserved and not i.sold]
+
+    # The experiment leaves half the catalog untouched so the bumped half has
+    # something to be compared against. Held-back listings are recorded as
+    # skipped rather than dropped, so the email still accounts for every one.
+    if experiment:
+        held = [i for i in active if group_for(site.item_id(i.href)) != BUMP]
+        for item in held:
+            results.append(Result(site.name, item.title, "skipped", CONTROL))
+        active = [i for i in active if group_for(site.item_id(i.href)) == BUMP]
+        log.info(
+            "%s: experiment on — %d to bump, %d held back",
+            site.name,
+            len(active),
+            len(held),
+        )
+
     if limit > 0:
         active = active[:limit]
 
@@ -746,7 +963,9 @@ def bump_site(
     return results, ""
 
 
-def run(sites: list[Site], publish: bool, limit: int) -> RunReport:
+def run(
+    sites: list[Site], publish: bool, limit: int, experiment: bool = False
+) -> RunReport:
     report = RunReport()
     ensure_dirs()
 
@@ -754,13 +973,15 @@ def run(sites: list[Site], publish: bool, limit: int) -> RunReport:
     # CDP connection. caffeinate -w exits by itself when this process does.
     subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())])
 
-    with sync_playwright() as playwright:
+    with owned_chrome(sites[0].catalog_url), sync_playwright() as playwright:
         browser = attach(playwright, sites[0].catalog_url)
         context = browser.contexts[0]
         page = context.new_page()
         try:
             for site in sites:
-                results, fatal = bump_site(page, browser, site, publish, limit)
+                results, fatal = bump_site(
+                    page, browser, site, publish, limit, experiment
+                )
                 report.results.extend(results)
                 if fatal:
                     report.fatal = fatal
@@ -768,7 +989,7 @@ def run(sites: list[Site], publish: bool, limit: int) -> RunReport:
                     return report
         finally:
             try:
-                page.close()  # only our tab — the user's Chrome keeps running
+                page.close()  # our tab; owned_chrome closes the browser if we opened it
             except PlaywrightError:
                 pass  # connection already gone; nothing left to close
 
@@ -776,43 +997,44 @@ def run(sites: list[Site], publish: bool, limit: int) -> RunReport:
 
 
 def login(sites: list[Site]) -> int:
-    """Get a signed-in, remote-debuggable Chrome running, then verify each site.
+    """Open a remote-debuggable Chrome, let you sign in, then verify each site.
 
     One profile carries every site's session, so this checks them all and names
-    the ones still needing a sign-in.
+    the ones still needing a sign-in. A Chrome this opened is closed at the end;
+    the cookies stay in the profile for the next run.
     """
     if cdp_reachable():
         log.info("Chrome with remote debugging is already running.")
     else:
         log.info("Opening Chrome — sign in, then come back here.")
-        launch_chrome(sites[0].catalog_url)
 
     names = ", ".join(site.name for site in sites)
-    input(f"Press Enter once you are signed in to {names}… ")
-
-    if PROFILE_DIR.exists():
-        os.chmod(PROFILE_DIR, 0o700)
-
     missing: list[str] = []
-    with sync_playwright() as playwright:
-        browser = attach(playwright, sites[0].catalog_url)
-        page = browser.contexts[0].new_page()
-        try:
-            for site in sites:
-                page.goto(site.catalog_url, wait_until="domcontentloaded")
-                if is_logged_in(page, site):
-                    log.info("%s: session confirmed.", site.name)
-                else:
-                    log.info("%s: NOT logged in.", site.name)
-                    missing.append(site.name)
-        finally:
-            page.close()
+    with owned_chrome(sites[0].catalog_url):
+        input(f"Press Enter once you are signed in to {names}… ")
+
+        if PROFILE_DIR.exists():
+            os.chmod(PROFILE_DIR, 0o700)
+
+        with sync_playwright() as playwright:
+            browser = attach(playwright, sites[0].catalog_url)
+            page = browser.contexts[0].new_page()
+            try:
+                for site in sites:
+                    page.goto(site.catalog_url, wait_until="domcontentloaded")
+                    if is_logged_in(page, site):
+                        log.info("%s: session confirmed.", site.name)
+                    else:
+                        log.info("%s: NOT logged in.", site.name)
+                        missing.append(site.name)
+            finally:
+                page.close()
 
     if missing:
         log.info("Finish signing in to %s, then run this again.", ", ".join(missing))
         return 2
 
-    log.info("All sessions confirmed. Chrome may be closed; runs relaunch it.")
+    log.info("All sessions confirmed. Runs open Chrome themselves and close it after.")
     return 0
 
 
@@ -830,7 +1052,7 @@ def status(sites: list[Site]) -> int:
     )
 
     signed_out: list[str] = []
-    with sync_playwright() as playwright:
+    with owned_chrome(sites[0].catalog_url), sync_playwright() as playwright:
         browser = attach(playwright, sites[0].catalog_url)
         page = browser.contexts[0].new_page()
         try:
@@ -880,7 +1102,7 @@ def status(sites: list[Site]) -> int:
 def probe(sites: list[Site]) -> int:
     """Dump each catalog page so selectors can be fixed after a redesign."""
     ensure_dirs()
-    with sync_playwright() as playwright:
+    with owned_chrome(sites[0].catalog_url), sync_playwright() as playwright:
         browser = attach(playwright, sites[0].catalog_url)
         page = browser.contexts[0].new_page()
         try:
@@ -902,9 +1124,94 @@ def probe(sites: list[Site]) -> int:
     return 0
 
 
+def stats(sites: list[Site]) -> int:
+    """Snapshot each listing's views, chats and favourites to a CSV.
+
+    Strictly read-only: it opens one page, reads numbers, and never touches an
+    edit form. The counters are Wallapop's own "Estadísticas de la semana", so
+    they are a rolling weekly figure rather than a lifetime total — fine for
+    comparing two groups at the same moment, misleading if read as all-time.
+    """
+    chosen = [site for site in sites if site.name == STATS_SITE]
+    if not chosen:
+        log.error("stats only covers %s, which is not in this run.", STATS_SITE)
+        return 2
+    site = chosen[0]
+
+    ensure_dirs()
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+
+    with owned_chrome(STATS_URL), sync_playwright() as playwright:
+        browser = attach(playwright, STATS_URL)
+        page = browser.contexts[0].new_page()
+        try:
+            page.goto(STATS_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(5000)
+            # The list renders lazily; scroll until the row count stops growing.
+            seen = -1
+            for _ in range(15):
+                found = page.locator("tsl-item-stats-row").count()
+                if found == seen:
+                    break
+                seen = found
+                page.mouse.wheel(0, 5000)
+                page.wait_for_timeout(800)
+            if "auth" in page.url or "login" in page.url:
+                log.error("RE-AUTH NEEDED — run: python bump.py login")
+                return 1
+            raw = page.evaluate(_STATS_JS)
+        finally:
+            page.close()
+
+    if not raw:
+        log.error(
+            "No listings found on %s — stale selector or page not loaded.", STATS_URL
+        )
+        return 1
+
+    target = STATS_DIR / f"{datetime.now().astimezone():%Y-%m-%d-%H%M}.csv"
+    bumped = 0
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "item_id",
+                "title",
+                "price",
+                "published",
+                "views",
+                "chats",
+                "favourites",
+                "group",
+            ]
+        )
+        for row in raw:
+            counters = list(row.get("counters") or [])
+            counters += [""] * (3 - len(counters))
+            item_id = site.item_id(row.get("href", ""))
+            group = group_for(item_id)
+            bumped += group == BUMP
+            writer.writerow(
+                [
+                    item_id,
+                    row.get("title", ""),
+                    row.get("price", ""),
+                    row.get("published", ""),
+                    parse_counter(counters[0]),
+                    parse_counter(counters[1]),
+                    parse_counter(counters[2]),
+                    group,
+                ]
+            )
+
+    log.info("Wrote %d listings to %s", len(raw), target)
+    log.info("Split: %d %s, %d %s", bumped, BUMP, len(raw) - bumped, CONTROL)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "login", "probe", "status"])
+    parser.add_argument("command", choices=["run", "login", "probe", "status", "stats"])
     parser.add_argument(
         "--publish",
         action="store_true",
@@ -915,6 +1222,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--site", default="all", help="a site from sites.toml, or 'all' (default)"
+    )
+    parser.add_argument(
+        "--experiment",
+        action="store_true",
+        help="bump only half the catalog, leaving the rest as a control group",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -940,15 +1252,18 @@ def main(argv: list[str] | None = None) -> int:
         return probe(chosen)
     if args.command == "status":
         return status(chosen)
+    if args.command == "stats":
+        return stats(chosen)
 
     log.info(
-        "Starting run (sites=%s, publish=%s, limit=%s)",
+        "Starting run (sites=%s, publish=%s, limit=%s, experiment=%s)",
         ", ".join(site.name for site in chosen),
         args.publish,
         args.limit or "all",
+        args.experiment,
     )
     try:
-        report = run(chosen, args.publish, args.limit)
+        report = run(chosen, args.publish, args.limit, args.experiment)
     except (RuntimeError, PlaywrightError, PlaywrightTimeout, OSError) as exc:
         report = RunReport(fatal=str(exc))
         log.exception("Run aborted")

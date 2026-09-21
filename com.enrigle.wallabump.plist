@@ -16,7 +16,7 @@
     <key>WorkingDirectory</key>
     <string>/Users/enrigle/Documents/code/wallapop</string>
 
-    <!-- Thursday (4) and Sunday (0) at 21:55, local time.
+    <!-- Thursday (4) and Sunday (0) at 22:25, local time.
 
          Evening on purpose: a laptop is usually open and genuinely awake then.
          A morning slot relied on a pmset scheduled wake, which on battery only
@@ -26,13 +26,13 @@
     <array>
         <dict>
             <key>Weekday</key><integer>4</integer>
-            <key>Hour</key><integer>21</integer>
-            <key>Minute</key><integer>55</integer>
+            <key>Hour</key><integer>22</integer>
+            <key>Minute</key><integer>25</integer>
         </dict>
         <dict>
             <key>Weekday</key><integer>0</integer>
-            <key>Hour</key><integer>21</integer>
-            <key>Minute</key><integer>55</integer>
+            <key>Hour</key><integer>22</integer>
+            <key>Minute</key><integer>25</integer>
         </dict>
     </array>
 
