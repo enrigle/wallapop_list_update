@@ -25,8 +25,11 @@ Usage:
     python bump.py run --publish --experiment  # bump half, hold half as control
 
 Each command opens that Chrome if it is not already running and closes it again
-when done, so it never lingers as your everyday browser. If Wallapop then asks for a login anyway, you get a
-RE-AUTH NEEDED email: run `python bump.py login` again.
+when done, so it never lingers as your everyday browser. If a site asks for a
+login anyway, you get a RE-AUTH NEEDED email: run `python bump.py login` again.
+
+launchd runs one agent per site — see the com.enrigle.wallabump.<site>.plist
+files — so Wallapop and Vinted get separate nights.
 """
 
 from __future__ import annotations
@@ -72,9 +75,11 @@ PROFILE_DIR = HOME_DIR / "chrome-profile"
 LOG_FILE = HOME_DIR / "bump.log"
 SITES_FILE = Path(__file__).resolve().parent / "sites.toml"
 
-PLIST_NAME = "com.enrigle.wallabump.plist"
-INSTALLED_PLIST = Path.home() / "Library" / "LaunchAgents" / PLIST_NAME
-REPO_PLIST = Path(__file__).resolve().parent / PLIST_NAME
+# One launchd agent per site, so each marketplace gets its own nights. Derived
+# from the site name rather than listed here: a third marketplace stays a
+# sites.toml entry, the same way every other site-specific thing does.
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+REPO_DIR = Path(__file__).resolve().parent
 
 KEYCHAIN_SERVICE = "wallabump-gmail"
 
@@ -188,6 +193,21 @@ def last_run(log_text: str) -> tuple[str, str] | None:
         if match:
             found = (match.group(1), match.group(2).strip())
     return found
+
+
+def plist_name(site_name: str) -> str:
+    """The launchd agent filename for a site."""
+    return f"com.enrigle.wallabump.{site_name}.plist"
+
+
+def plist_for(site_name: str) -> Path:
+    """The installed agent for a site, falling back to the repo's copy.
+
+    status() reports on whichever it finds, and says so loudly when only the
+    repo copy exists — an uninstalled agent fires nothing at all.
+    """
+    installed = LAUNCH_AGENTS_DIR / plist_name(site_name)
+    return installed if installed.exists() else REPO_DIR / plist_name(site_name)
 
 
 def schedule_entries(plist_path: Path) -> list[dict[str, int]]:
@@ -1079,21 +1099,22 @@ def status(sites: list[Site]) -> int:
     else:
         log.info("Last run  %s  %s", previous[0], previous[1])
 
-    plist = INSTALLED_PLIST if INSTALLED_PLIST.exists() else REPO_PLIST
-    entries = schedule_entries(plist)
     # Local time on purpose: launchd fires on the wall clock, so an aware
     # local datetime is what the schedule actually means.
     now = datetime.now().astimezone()
-    upcoming = next_fire(entries, now)
-    if upcoming is None:
-        log.info("Next run  no schedule found in %s", plist)
-    else:
+    for site in sites:
+        plist = plist_for(site.name)
+        upcoming = next_fire(schedule_entries(plist), now)
+        if upcoming is None:
+            log.info("Next run  %-9s no schedule found in %s", site.name, plist)
+            continue
         log.info(
-            "Next run  %s  (in %s)",
+            "Next run  %-9s %s  (in %s)",
+            site.name,
             upcoming.strftime("%a %H:%M"),
             human_delta((upcoming - now).total_seconds()),
         )
-        if not INSTALLED_PLIST.exists():
+        if not (LAUNCH_AGENTS_DIR / plist_name(site.name)).exists():
             log.info("          NOT INSTALLED — nothing will fire. Copy the plist.")
 
     return 1 if signed_out else 0

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.enrigle.wallabump.vinted</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/enrigle/Documents/code/wallapop/.venv/bin/python</string>
+        <string>/Users/enrigle/Documents/code/wallapop/bump.py</string>
+        <string>run</string>
+        <string>--publish</string>
+        <string>--site</string>
+        <string>vinted</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/enrigle/Documents/code/wallapop</string>
+
+    <!-- Friday (5) and Monday (1) at 22:25, local time.
+
+         One agent per site, so each marketplace gets its own nights and a
+         night runs ~25 minutes instead of ~50. Every listing is still bumped
+         twice a week; only the nights differ. Keep the two agents on
+         different weekdays.
+
+         Evening on purpose: a laptop is usually open and genuinely awake then.
+         A night slot would rely on a scheduled wake, which on this Mac is a
+         4-6 second DarkWake even on mains and even for a user-visible alarm -
+         nowhere near enough to edit a catalog. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>22</integer>
+            <key>Minute</key><integer>25</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>22</integer>
+            <key>Minute</key><integer>25</integer>
+        </dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/enrigle/.wallapop-bump/launchd-vinted.err</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/enrigle/.wallapop-bump/launchd-vinted.out</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

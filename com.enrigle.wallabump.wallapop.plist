@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.enrigle.wallabump</string>
+    <string>com.enrigle.wallabump.wallapop</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -11,6 +11,12 @@
         <string>/Users/enrigle/Documents/code/wallapop/bump.py</string>
         <string>run</string>
         <string>--publish</string>
+        <string>--site</string>
+        <string>wallapop</string>
+        <!-- Half the catalog is held back as a control group, to find out
+             whether the edit resurfaces a listing at all. Drop this once
+             the stats snapshots have answered that. -->
+        <string>--experiment</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -18,10 +24,15 @@
 
     <!-- Thursday (4) and Sunday (0) at 22:25, local time.
 
+         One agent per site, so each marketplace gets its own nights and a
+         night runs ~25 minutes instead of ~50. Every listing is still bumped
+         twice a week; only the nights differ. Keep the two agents on
+         different weekdays.
+
          Evening on purpose: a laptop is usually open and genuinely awake then.
-         A morning slot relied on a pmset scheduled wake, which on battery only
-         produces a DarkWake - a few seconds of CPU before the machine sleeps
-         again - and that is not enough to edit a catalog. -->
+         A night slot would rely on a scheduled wake, which on this Mac is a
+         4-6 second DarkWake even on mains and even for a user-visible alarm -
+         nowhere near enough to edit a catalog. -->
     <key>StartCalendarInterval</key>
     <array>
         <dict>
@@ -40,10 +51,10 @@
     <false/>
 
     <key>StandardErrorPath</key>
-    <string>/Users/enrigle/.wallapop-bump/launchd.err</string>
+    <string>/Users/enrigle/.wallapop-bump/launchd-wallapop.err</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/enrigle/.wallapop-bump/launchd.out</string>
+    <string>/Users/enrigle/.wallapop-bump/launchd-wallapop.out</string>
 
     <key>ProcessType</key>
     <string>Background</string>

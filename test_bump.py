@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import plistlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,8 @@ from bump import (
     next_fire,
     page_targets_to_activate,
     parse_counter,
+    plist_for,
+    plist_name,
     schedule_entries,
     slept_seconds,
     toggle,
@@ -458,7 +461,7 @@ def at(year: int, month: int, day: int, hour: int, minute: int) -> datetime:
     return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
 
 
-# Thursday and Sunday at 21:55, matching the shipped plist.
+# Synthetic, not the shipped schedule: these only exercise next_fire().
 SCHEDULE = [
     {"Weekday": 4, "Hour": 21, "Minute": 55},
     {"Weekday": 0, "Hour": 21, "Minute": 55},
@@ -503,12 +506,61 @@ def test_next_fire_returns_none_rather_than_guessing(
     assert next_fire(entries, at(2026, 9, 10, 14, 0)) is None
 
 
-def test_schedule_entries_reads_the_shipped_plist() -> None:
-    entries = schedule_entries(Path("com.enrigle.wallabump.plist"))
+def shipped(site_name: str) -> Path:
+    return Path(plist_name(site_name))
+
+
+@pytest.mark.parametrize(
+    ("site_name", "days"), [("wallapop", {0, 4}), ("vinted", {1, 5})]
+)
+def test_each_shipped_agent_has_its_own_two_nights(
+    site_name: str, days: set[int]
+) -> None:
+    entries = schedule_entries(shipped(site_name))
     assert len(entries) == 2
     assert {e["Hour"] for e in entries} == {22}
     assert {e["Minute"] for e in entries} == {25}
-    assert {e["Weekday"] for e in entries} == {0, 4}
+    assert {e["Weekday"] for e in entries} == days
+
+
+def test_the_two_agents_never_share_a_night() -> None:
+    # Both sites on one night is the old single-agent behaviour back again,
+    # and with --experiment on one of them it would skew the control group.
+    wallapop = {e["Weekday"] for e in schedule_entries(shipped("wallapop"))}
+    vinted = {e["Weekday"] for e in schedule_entries(shipped("vinted"))}
+    assert wallapop & vinted == set()
+
+
+@pytest.mark.parametrize("site_name", ["wallapop", "vinted"])
+def test_each_agent_runs_the_site_it_is_named_for(site_name: str) -> None:
+    # A copy-pasted plist still saying --site wallapop would bump one catalogue
+    # twice a week and quietly never touch the other.
+    args = plistlib.loads(shipped(site_name).read_bytes())["ProgramArguments"]
+    assert args[args.index("--site") + 1] == site_name
+    assert "run" in args
+    assert "--publish" in args
+
+
+def test_plist_name_is_built_from_the_site() -> None:
+    assert plist_name("vinted") == "com.enrigle.wallabump.vinted.plist"
+
+
+def test_plist_for_prefers_the_installed_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    installed = tmp_path / plist_name("vinted")
+    installed.write_text("", encoding="utf-8")
+    monkeypatch.setattr(bump, "LAUNCH_AGENTS_DIR", tmp_path)
+    assert plist_for("vinted") == installed
+
+
+def test_plist_for_falls_back_to_the_repo_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Nothing installed: status still has a schedule to show, and says it is
+    # not installed rather than reporting no schedule at all.
+    monkeypatch.setattr(bump, "LAUNCH_AGENTS_DIR", tmp_path)
+    assert plist_for("vinted") == bump.REPO_DIR / plist_name("vinted")
 
 
 def test_schedule_entries_on_a_missing_file_is_empty() -> None:
