@@ -616,7 +616,7 @@ def is_logged_in(page: Page, site: Site) -> bool:
 
 def open_edit_form(page: Page, site: Site, item: Item) -> Locator | None:
     """Open the item's edit form. Tries the direct URL, falls back to clicking."""
-    if site.item_id(item.href):
+    if site.edit_url and site.item_id(item.href):
         page.goto(site.edit_link(item.href), wait_until="domcontentloaded")
         textarea = find_textarea(page, site)
         if textarea is not None:
@@ -629,8 +629,8 @@ def open_edit_form(page: Page, site: Site, item: Item) -> Locator | None:
     control = page.get_by_role("link", name=site.edit_pattern).or_(
         page.get_by_role("button", name=site.edit_pattern)
     )
-    control.first.click(timeout=8000)
-    return find_textarea(page, site)
+    control.first.click(timeout=15000)
+    return find_textarea(page, site, timeout=15000)
 
 
 def read_description(page: Page, site: Site, item: Item) -> tuple[str, int] | None:

@@ -226,7 +226,7 @@ def test_the_shipped_config_loads() -> None:
 
 def test_every_shipped_edit_url_takes_an_item_id() -> None:
     for site in load_sites().values():
-        assert "{item_id}" in site.edit_url, site.name
+        assert site.edit_url == "" or "{item_id}" in site.edit_url, site.name
 
 
 def test_every_shipped_id_regex_has_one_group() -> None:
