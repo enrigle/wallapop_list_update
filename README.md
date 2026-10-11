@@ -25,6 +25,7 @@ Prefix everything with the venv: `.venv/bin/python bump.py …`
 | `run --publish --limit 1` | Real, one listing per site. Smoke test. |
 | `probe` | Dump catalog HTML when selectors break. |
 | `stats` | Snapshot Wallapop views/chats/favourites to CSV. Read-only. |
+| `analyze` | Crossover experiment result from the stats CSVs. |
 
 Add `--site vinted` for one site, `--experiment` to bump only half, `-v` for debug logging.
 
@@ -179,15 +180,23 @@ Direction alternates run to run. Both directions bump equally — an edit is an 
 
 ## Measuring whether it works
 
-Nothing had ever tested the premise that an edit resurfaces a listing.
+Does the edit actually resurface a listing? A **crossover** experiment answers it for Wallapop:
+
+- `--experiment` (on in the Wallapop agent) bumps half the catalogue per ISO week. The halves swap every week, so each listing is compared against itself.
+- `com.enrigle.wallabump.stats.plist` snapshots Wallapop's weekly stats daily at 20:00 into `~/.wallapop-bump/stats/`. Read-only.
+- `bump.py analyze` uses Monday snapshots. Each Monday's figure covers the week that ended. Output: per-listing views lift (bumped weeks − control weeks), mean lift, exact sign-flip p-value.
+
+**Window:** ISO weeks 42–45 (Mon 12 Oct → Sun 8 Nov 2026). Run `analyze` after the Mon 9 Nov snapshot.
+
+**During the window:** never run Wallapop with `--publish` but no `--experiment`. That bumps the control half and ruins the comparison.
 
 ```bash
-.venv/bin/python bump.py stats   # baseline, then again after two runs
+cp com.enrigle.wallabump.stats.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.enrigle.wallabump.stats.plist
+.venv/bin/python bump.py analyze
 ```
 
-`--experiment` splits the catalogue by a hash of each listing's id: half bumped, half left alone, stable across runs. Held-back listings show as `skipped  control`. `stats` writes a CSV of views, chats and favourites per listing. If the bumped half does not beat the control half, the edit does nothing.
-
-Caveats: the numbers are Wallapop's "Estadísticas de la semana", a rolling figure rather than lifetime totals; and with ~23 listings the groups are small and uneven, so only a large difference means anything.
+Caveats: ~15 listings × 4 weeks only shows a large effect. A null result means "no large effect", not "no effect". Last week's bump may linger into this week's control week, so the lift is underestimated.
 
 ---
 

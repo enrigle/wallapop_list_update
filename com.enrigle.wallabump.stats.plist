@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.enrigle.wallabump.stats</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/enrigle/Documents/code/wallapop/.venv/bin/python</string>
+        <string>/Users/enrigle/Documents/code/wallapop/bump.py</string>
+        <string>stats</string>
+        <string>--site</string>
+        <string>wallapop</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/enrigle/Documents/code/wallapop</string>
+
+    <!-- Every day at 20:00: a read-only snapshot of Wallapop's weekly stats
+         for the crossover experiment. `analyze` uses the Monday ones.
+         Kept well clear of the 22:25 bump runs, which use the same Chrome
+         profile. Unload once the experiment has its answer. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>20</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/enrigle/.wallapop-bump/launchd-stats.err</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/enrigle/.wallapop-bump/launchd-stats.out</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

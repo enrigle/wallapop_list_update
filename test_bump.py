@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import plistlib
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -20,12 +20,15 @@ from bump import (
     human_delta,
     last_run,
     load_sites,
+    measured_week,
     next_fire,
     page_targets_to_activate,
+    paired_diffs,
     parse_counter,
     plist_for,
     plist_name,
     schedule_entries,
+    sign_flip_p,
     slept_seconds,
     toggle,
 )
@@ -322,34 +325,92 @@ def test_zero_reads_as_zero() -> None:
 
 def test_group_is_stable_for_the_same_id() -> None:
     # The control group only means anything if membership survives re-runs.
-    assert group_for("mesa-de-roble-123456") == group_for("mesa-de-roble-123456")
+    assert group_for("mesa-de-roble-123456", 42) == group_for(
+        "mesa-de-roble-123456", 42
+    )
 
 
 def test_both_groups_are_used() -> None:
     ids = [f"item-{n}" for n in range(200)]
-    groups = {group_for(i) for i in ids}
+    groups = {group_for(i, 42) for i in ids}
     assert groups == {BUMP, CONTROL}
 
 
 def test_the_split_is_roughly_even() -> None:
     # Not exactly half, but a wild skew would gut the comparison.
     ids = [f"item-{n}" for n in range(400)]
-    bumped = sum(1 for i in ids if group_for(i) == BUMP)
+    bumped = sum(1 for i in ids if group_for(i, 42) == BUMP)
     assert 150 < bumped < 250
 
 
 def test_an_empty_id_lands_in_the_control_group() -> None:
     # No id means no reliable edit form, so it must never count as bumped.
-    assert group_for("") == CONTROL
+    assert group_for("", 42) == CONTROL
 
 
 def test_real_id_shapes_from_both_sites_are_handled() -> None:
     for item_id in ("mesa-de-roble-123456", "9873738631", "kimono-judo-7-8-anos"):
-        assert group_for(item_id) in (BUMP, CONTROL)
+        assert group_for(item_id, 42) in (BUMP, CONTROL)
 
 
 def test_accented_and_unicode_ids_do_not_crash() -> None:
-    assert group_for("bolso-pañalera-y-portachupetes") in (BUMP, CONTROL)
+    assert group_for("bolso-pañalera-y-portachupetes", 42) in (BUMP, CONTROL)
+
+
+def test_the_halves_swap_every_week() -> None:
+    # The crossover: a listing bumped this week is held back the next.
+    for item_id in (f"item-{n}" for n in range(50)):
+        assert group_for(item_id, 42) != group_for(item_id, 43)
+        assert group_for(item_id, 42) == group_for(item_id, 44)
+
+
+def test_an_empty_id_is_control_in_every_week() -> None:
+    assert {group_for("", w) for w in range(1, 54)} == {CONTROL}
+
+
+def test_only_monday_snapshots_inside_the_window_count() -> None:
+    assert measured_week(date(2026, 10, 19)) == 42
+    assert measured_week(date(2026, 11, 9)) == 45
+    assert measured_week(date(2026, 10, 20)) is None  # Tuesday
+    assert measured_week(date(2026, 10, 12)) is None  # measures week 41
+
+
+def views_for(item_id: str, bumped: int, control: int) -> list[tuple[str, int, int]]:
+    return [
+        (item_id, w, bumped if group_for(item_id, w) == BUMP else control)
+        for w in (42, 43, 44, 45)
+    ]
+
+
+def test_paired_diffs_compare_a_listing_with_itself() -> None:
+    assert paired_diffs(views_for("mesa-1", bumped=30, control=10)) == {"mesa-1": 20}
+
+
+def test_a_listing_seen_in_one_arm_only_is_left_out() -> None:
+    # Weeks 42 and 44 put a listing in the same half: no control to compare.
+    assert paired_diffs([("mesa-1", 42, 5), ("mesa-1", 44, 7)]) == {}
+    assert paired_diffs([]) == {}
+
+
+def test_a_consistent_lift_is_significant() -> None:
+    diffs = [5.0, 8.0, 3.0, 6.0, 9.0, 4.0, 7.0, 5.0, 6.0, 8.0]
+    assert sign_flip_p(diffs) < 0.01
+
+
+def test_no_lift_is_not_significant() -> None:
+    assert sign_flip_p([5.0, -5.0, 3.0, -3.0, 1.0, -1.0]) == 1.0
+    assert sign_flip_p([0.0, 0.0, 0.0]) == 1.0
+    assert sign_flip_p([]) == 1.0
+
+
+def test_stats_agent_runs_daily_clear_of_the_bump_nights() -> None:
+    # It shares the Chrome profile with the bump runs, so it must never
+    # start at 22:25 and collide with one.
+    plist = plistlib.loads(Path("com.enrigle.wallabump.stats.plist").read_bytes())
+    assert "stats" in plist["ProgramArguments"]
+    entry = plist["StartCalendarInterval"]
+    assert "Weekday" not in entry
+    assert (entry["Hour"], entry["Minute"]) == (20, 0)
 
 
 # --- Chrome lifecycle ---------------------------------------------------------

@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -52,7 +53,7 @@ import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -390,13 +391,18 @@ def parse_counter(text: str) -> int:
     return int(digits) if digits else 0
 
 
-def group_for(item_id: str) -> str:
-    """Which experiment half a listing belongs to, stably.
+def group_for(item_id: str, week: int) -> str:
+    """Which experiment half a listing belongs to in a given ISO week.
 
     Hashed from the id rather than taken from catalog position, so a listing
     keeps its group as the catalog reorders — a control group that reshuffles
     every run measures nothing. sha256 because Python's own hash() is salted
     per process and would reassign every listing on each run.
+
+    The halves swap every ISO week (crossover): each listing spends some weeks
+    bumped and some held back, so it is compared against itself rather than
+    against a different, possibly more popular, listing. Both Wallapop nights
+    (Thu, Sun) fall in one Mon–Sun ISO week, so a half gets both bumps.
 
     An id-less listing goes to the control group: the run cannot open an edit
     form for it reliably anyway, so it must not count as bumped.
@@ -404,7 +410,11 @@ def group_for(item_id: str) -> str:
     if not item_id:
         return CONTROL
     digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
-    return BUMP if int(digest, 16) % 2 == 0 else CONTROL
+    return BUMP if (int(digest, 16) + week) % 2 == 0 else CONTROL
+
+
+def this_week() -> int:
+    return datetime.now().astimezone().isocalendar().week
 
 
 # --- Results ------------------------------------------------------------------
@@ -939,10 +949,11 @@ def bump_site(
     # something to be compared against. Held-back listings are recorded as
     # skipped rather than dropped, so the email still accounts for every one.
     if experiment:
-        held = [i for i in active if group_for(site.item_id(i.href)) != BUMP]
+        week = this_week()
+        held = [i for i in active if group_for(site.item_id(i.href), week) != BUMP]
         for item in held:
             results.append(Result(site.name, item.title, "skipped", CONTROL))
-        active = [i for i in active if group_for(site.item_id(i.href)) == BUMP]
+        active = [i for i in active if group_for(site.item_id(i.href), week) == BUMP]
         log.info(
             "%s: experiment on — %d to bump, %d held back",
             site.name,
@@ -1191,6 +1202,10 @@ def stats(sites: list[Site]) -> int:
         return 1
 
     target = STATS_DIR / f"{datetime.now().astimezone():%Y-%m-%d-%H%M}.csv"
+    # The group column is this week's assignment, i.e. the treatment the
+    # counters are about to accumulate — not the week they already reflect.
+    # `analyze` recomputes the group for the week each snapshot measures.
+    week = this_week()
     bumped = 0
     with target.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -1204,13 +1219,14 @@ def stats(sites: list[Site]) -> int:
                 "chats",
                 "favourites",
                 "group",
+                "iso_week",
             ]
         )
         for row in raw:
             counters = list(row.get("counters") or [])
             counters += [""] * (3 - len(counters))
             item_id = site.item_id(row.get("href", ""))
-            group = group_for(item_id)
+            group = group_for(item_id, week)
             bumped += group == BUMP
             writer.writerow(
                 [
@@ -1222,6 +1238,7 @@ def stats(sites: list[Site]) -> int:
                     parse_counter(counters[1]),
                     parse_counter(counters[2]),
                     group,
+                    week,
                 ]
             )
 
@@ -1230,9 +1247,110 @@ def stats(sites: list[Site]) -> int:
     return 0
 
 
+# The crossover started on this Monday (ISO week 42). Snapshots measuring
+# earlier weeks used the old fixed split, or none, and must not be mixed in.
+EXPERIMENT_START = date(2026, 10, 12)
+
+
+def measured_week(snapshot: date) -> int | None:
+    """The ISO week a snapshot's weekly counters describe, or None to ignore it.
+
+    Only Monday snapshots count: Wallapop's figure is "Estadísticas de la
+    semana", so Monday's reading covers the week that just ended. Other days
+    straddle two treatment weeks and would blur bumped into control.
+    """
+    if snapshot.weekday() != 0:
+        return None
+    week_start = snapshot - timedelta(days=7)
+    if week_start < EXPERIMENT_START:
+        return None
+    return week_start.isocalendar().week
+
+
+def paired_diffs(observations: list[tuple[str, int, int]]) -> dict[str, float]:
+    """Per listing: mean views in bumped weeks minus mean in control weeks.
+
+    Takes (item_id, week, views). A listing seen only in one arm — sold early,
+    listed late — has nothing to be compared with and is left out.
+    """
+    arms: dict[str, dict[str, list[int]]] = {}
+    for item_id, week, views in observations:
+        group = group_for(item_id, week)
+        arms.setdefault(item_id, {BUMP: [], CONTROL: []})[group].append(views)
+    return {
+        item_id: sum(a[BUMP]) / len(a[BUMP]) - sum(a[CONTROL]) / len(a[CONTROL])
+        for item_id, a in arms.items()
+        if a[BUMP] and a[CONTROL]
+    }
+
+
+def sign_flip_p(diffs: list[float]) -> float:
+    """Two-sided exact p-value that the mean diff is zero.
+
+    Under "the bump does nothing" each listing's diff is as likely to be
+    negative as positive, so every sign pattern is equally likely; the p-value
+    is the share of patterns whose mean is at least as extreme as observed.
+    """
+    # ponytail: exact 2^n enumeration, fine to n≈20; sample patterns beyond that.
+    if not diffs:
+        return 1.0
+    observed = abs(sum(diffs))
+    patterns = list(itertools.product((1, -1), repeat=len(diffs)))
+    extreme = sum(
+        1
+        for signs in patterns
+        if abs(sum(s * d for s, d in zip(signs, diffs))) >= observed - 1e-9
+    )
+    return extreme / len(patterns)
+
+
+def analyze() -> int:
+    """Read the stats CSVs and report whether bumped weeks beat control weeks."""
+    observations: list[tuple[str, int, int]] = []
+    latest: dict[int, Path] = {}
+    if STATS_DIR.exists():
+        for path in sorted(STATS_DIR.glob("*.csv")):
+            try:
+                taken = date.fromisoformat(path.stem[:10])  # 2026-10-19-2000.csv
+            except ValueError:
+                continue
+            week = measured_week(taken)
+            if week is not None:
+                latest[week] = path  # sorted, so the last one of a Monday wins
+    for week, path in sorted(latest.items()):
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                views = row.get("views", "")
+                if row.get("item_id") and views.isdigit():
+                    observations.append((row["item_id"], week, int(views)))
+
+    diffs = paired_diffs(observations)
+    if not diffs:
+        log.error(
+            "No listing has both a bumped and a control week yet. Needs Monday "
+            "snapshots from %s on, covering at least two weeks (found %d).",
+            EXPERIMENT_START,
+            len(latest),
+        )
+        return 1
+
+    for item_id, diff in sorted(diffs.items(), key=lambda kv: kv[1]):
+        print(f"{diff:+8.1f}  {item_id}")
+    effect = sum(diffs.values()) / len(diffs)
+    p = sign_flip_p(list(diffs.values()))
+    print(
+        f"\nWeeks: {', '.join(str(w) for w in sorted(latest))}  "
+        f"Listings: {len(diffs)}\n"
+        f"Mean views per week, bumped minus control: {effect:+.1f}  (p = {p:.3f})"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "login", "probe", "status", "stats"])
+    parser.add_argument(
+        "command", choices=["run", "login", "probe", "status", "stats", "analyze"]
+    )
     parser.add_argument(
         "--publish",
         action="store_true",
@@ -1275,6 +1393,8 @@ def main(argv: list[str] | None = None) -> int:
         return status(chosen)
     if args.command == "stats":
         return stats(chosen)
+    if args.command == "analyze":
+        return analyze()
 
     log.info(
         "Starting run (sites=%s, publish=%s, limit=%s, experiment=%s)",
