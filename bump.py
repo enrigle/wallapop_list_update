@@ -25,8 +25,11 @@ Usage:
     python bump.py run --publish --experiment  # bump half, hold half as control
 
 Each command opens that Chrome if it is not already running and closes it again
-when done, so it never lingers as your everyday browser. If Wallapop then asks for a login anyway, you get a
-RE-AUTH NEEDED email: run `python bump.py login` again.
+when done, so it never lingers as your everyday browser. If a site asks for a
+login anyway, you get a RE-AUTH NEEDED email: run `python bump.py login` again.
+
+launchd runs one agent per site — see the com.enrigle.wallabump.<site>.plist
+files — so Wallapop and Vinted get separate nights.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -49,10 +53,11 @@ import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 import tomllib
 from playwright.sync_api import (
@@ -72,9 +77,11 @@ PROFILE_DIR = HOME_DIR / "chrome-profile"
 LOG_FILE = HOME_DIR / "bump.log"
 SITES_FILE = Path(__file__).resolve().parent / "sites.toml"
 
-PLIST_NAME = "com.enrigle.wallabump.plist"
-INSTALLED_PLIST = Path.home() / "Library" / "LaunchAgents" / PLIST_NAME
-REPO_PLIST = Path(__file__).resolve().parent / PLIST_NAME
+# One launchd agent per site, so each marketplace gets its own nights. Derived
+# from the site name rather than listed here: a third marketplace stays a
+# sites.toml entry, the same way every other site-specific thing does.
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+REPO_DIR = Path(__file__).resolve().parent
 
 KEYCHAIN_SERVICE = "wallabump-gmail"
 
@@ -188,6 +195,21 @@ def last_run(log_text: str) -> tuple[str, str] | None:
         if match:
             found = (match.group(1), match.group(2).strip())
     return found
+
+
+def plist_name(site_name: str) -> str:
+    """The launchd agent filename for a site."""
+    return f"com.enrigle.wallabump.{site_name}.plist"
+
+
+def plist_for(site_name: str) -> Path:
+    """The installed agent for a site, falling back to the repo's copy.
+
+    status() reports on whichever it finds, and says so loudly when only the
+    repo copy exists — an uninstalled agent fires nothing at all.
+    """
+    installed = LAUNCH_AGENTS_DIR / plist_name(site_name)
+    return installed if installed.exists() else REPO_DIR / plist_name(site_name)
 
 
 def schedule_entries(plist_path: Path) -> list[dict[str, int]]:
@@ -370,13 +392,18 @@ def parse_counter(text: str) -> int:
     return int(digits) if digits else 0
 
 
-def group_for(item_id: str) -> str:
-    """Which experiment half a listing belongs to, stably.
+def group_for(item_id: str, week: int) -> str:
+    """Which experiment half a listing belongs to in a given ISO week.
 
     Hashed from the id rather than taken from catalog position, so a listing
     keeps its group as the catalog reorders — a control group that reshuffles
     every run measures nothing. sha256 because Python's own hash() is salted
     per process and would reassign every listing on each run.
+
+    The halves swap every ISO week (crossover): each listing spends some weeks
+    bumped and some held back, so it is compared against itself rather than
+    against a different, possibly more popular, listing. Both Wallapop nights
+    (Thu, Sun) fall in one Mon–Sun ISO week, so a half gets both bumps.
 
     An id-less listing goes to the control group: the run cannot open an edit
     form for it reliably anyway, so it must not count as bumped.
@@ -384,7 +411,11 @@ def group_for(item_id: str) -> str:
     if not item_id:
         return CONTROL
     digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
-    return BUMP if int(digest, 16) % 2 == 0 else CONTROL
+    return BUMP if (int(digest, 16) + week) % 2 == 0 else CONTROL
+
+
+def this_week() -> int:
+    return datetime.now().astimezone().isocalendar().week
 
 
 # --- Results ------------------------------------------------------------------
@@ -596,7 +627,7 @@ def is_logged_in(page: Page, site: Site) -> bool:
 
 def open_edit_form(page: Page, site: Site, item: Item) -> Locator | None:
     """Open the item's edit form. Tries the direct URL, falls back to clicking."""
-    if site.item_id(item.href):
+    if site.edit_url and site.item_id(item.href):
         page.goto(site.edit_link(item.href), wait_until="domcontentloaded")
         textarea = find_textarea(page, site)
         if textarea is not None:
@@ -609,8 +640,8 @@ def open_edit_form(page: Page, site: Site, item: Item) -> Locator | None:
     control = page.get_by_role("link", name=site.edit_pattern).or_(
         page.get_by_role("button", name=site.edit_pattern)
     )
-    control.first.click(timeout=8000)
-    return find_textarea(page, site)
+    control.first.click(timeout=15000)
+    return find_textarea(page, site, timeout=15000)
 
 
 def read_description(page: Page, site: Site, item: Item) -> tuple[str, int] | None:
@@ -919,10 +950,11 @@ def bump_site(
     # something to be compared against. Held-back listings are recorded as
     # skipped rather than dropped, so the email still accounts for every one.
     if experiment:
-        held = [i for i in active if group_for(site.item_id(i.href)) != BUMP]
+        week = this_week()
+        held = [i for i in active if group_for(site.item_id(i.href), week) != BUMP]
         for item in held:
             results.append(Result(site.name, item.title, "skipped", CONTROL))
-        active = [i for i in active if group_for(site.item_id(i.href)) == BUMP]
+        active = [i for i in active if group_for(site.item_id(i.href), week) == BUMP]
         log.info(
             "%s: experiment on — %d to bump, %d held back",
             site.name,
@@ -1079,21 +1111,22 @@ def status(sites: list[Site]) -> int:
     else:
         log.info("Last run  %s  %s", previous[0], previous[1])
 
-    plist = INSTALLED_PLIST if INSTALLED_PLIST.exists() else REPO_PLIST
-    entries = schedule_entries(plist)
     # Local time on purpose: launchd fires on the wall clock, so an aware
     # local datetime is what the schedule actually means.
     now = datetime.now().astimezone()
-    upcoming = next_fire(entries, now)
-    if upcoming is None:
-        log.info("Next run  no schedule found in %s", plist)
-    else:
+    for site in sites:
+        plist = plist_for(site.name)
+        upcoming = next_fire(schedule_entries(plist), now)
+        if upcoming is None:
+            log.info("Next run  %-9s no schedule found in %s", site.name, plist)
+            continue
         log.info(
-            "Next run  %s  (in %s)",
+            "Next run  %-9s %s  (in %s)",
+            site.name,
             upcoming.strftime("%a %H:%M"),
             human_delta((upcoming - now).total_seconds()),
         )
-        if not INSTALLED_PLIST.exists():
+        if not (LAUNCH_AGENTS_DIR / plist_name(site.name)).exists():
             log.info("          NOT INSTALLED — nothing will fire. Copy the plist.")
 
     return 1 if signed_out else 0
@@ -1124,6 +1157,41 @@ def probe(sites: list[Site]) -> int:
     return 0
 
 
+STATS_ATTEMPTS = 3
+STATS_RETRY_SECONDS = 120
+
+
+def read_stats_page() -> list[dict[str, Any]] | None:
+    """One attempt at reading the stats page.
+
+    Returns None when signed out, [] when no rows rendered. Raises on browser
+    errors and timeouts; the caller decides whether to try again.
+    """
+    with owned_chrome(STATS_URL), sync_playwright() as playwright:
+        browser = attach(playwright, STATS_URL)
+        page = browser.contexts[0].new_page()
+        try:
+            page.goto(STATS_URL, wait_until="domcontentloaded", timeout=60000)
+            if "auth" in page.url or "login" in page.url:
+                return None
+            page.wait_for_selector("tsl-item-stats-row", timeout=30000)
+            # The list renders lazily; scroll until the row count stops growing.
+            seen = -1
+            for _ in range(15):
+                found = page.locator("tsl-item-stats-row").count()
+                if found == seen:
+                    break
+                seen = found
+                page.mouse.wheel(0, 5000)
+                page.wait_for_timeout(800)
+            if "auth" in page.url or "login" in page.url:
+                return None
+            rows: list[dict[str, Any]] = page.evaluate(_STATS_JS)
+            return rows
+        finally:
+            page.close()
+
+
 def stats(sites: list[Site]) -> int:
     """Snapshot each listing's views, chats and favourites to a CSV.
 
@@ -1141,35 +1209,40 @@ def stats(sites: list[Site]) -> int:
     ensure_dirs()
     STATS_DIR.mkdir(parents=True, exist_ok=True)
 
-    with owned_chrome(STATS_URL), sync_playwright() as playwright:
-        browser = attach(playwright, STATS_URL)
-        page = browser.contexts[0].new_page()
+    # The stats page often times out or renders empty on the first try; a
+    # missed Monday snapshot loses a whole experiment week, so try again.
+    # Each attempt opens and closes its own Chrome, which also clears a
+    # frozen tab.
+    raw: list[dict[str, Any]] | None = []
+    for attempt in range(1, STATS_ATTEMPTS + 1):
         try:
-            page.goto(STATS_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(5000)
-            # The list renders lazily; scroll until the row count stops growing.
-            seen = -1
-            for _ in range(15):
-                found = page.locator("tsl-item-stats-row").count()
-                if found == seen:
-                    break
-                seen = found
-                page.mouse.wheel(0, 5000)
-                page.wait_for_timeout(800)
-            if "auth" in page.url or "login" in page.url:
-                log.error("RE-AUTH NEEDED — run: python bump.py login")
-                return 1
-            raw = page.evaluate(_STATS_JS)
-        finally:
-            page.close()
+            raw = read_stats_page()
+        except (PlaywrightError, PlaywrightTimeout, RuntimeError) as exc:
+            log.warning("stats attempt %d/%d failed: %s", attempt, STATS_ATTEMPTS, exc)
+            raw = []
+        if raw is None:
+            log.error("RE-AUTH NEEDED — run: python bump.py login")
+            return 1
+        if raw:
+            break
+        if attempt < STATS_ATTEMPTS:
+            log.info("No stats rows yet; retrying in %ds.", STATS_RETRY_SECONDS)
+            time.sleep(STATS_RETRY_SECONDS)
 
     if not raw:
         log.error(
-            "No listings found on %s — stale selector or page not loaded.", STATS_URL
+            "No listings found on %s after %d attempts — stale selector or page "
+            "not loaded.",
+            STATS_URL,
+            STATS_ATTEMPTS,
         )
         return 1
 
     target = STATS_DIR / f"{datetime.now().astimezone():%Y-%m-%d-%H%M}.csv"
+    # The group column is this week's assignment, i.e. the treatment the
+    # counters are about to accumulate — not the week they already reflect.
+    # `analyze` recomputes the group for the week each snapshot measures.
+    week = this_week()
     bumped = 0
     with target.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -1183,13 +1256,14 @@ def stats(sites: list[Site]) -> int:
                 "chats",
                 "favourites",
                 "group",
+                "iso_week",
             ]
         )
         for row in raw:
             counters = list(row.get("counters") or [])
             counters += [""] * (3 - len(counters))
             item_id = site.item_id(row.get("href", ""))
-            group = group_for(item_id)
+            group = group_for(item_id, week)
             bumped += group == BUMP
             writer.writerow(
                 [
@@ -1201,6 +1275,7 @@ def stats(sites: list[Site]) -> int:
                     parse_counter(counters[1]),
                     parse_counter(counters[2]),
                     group,
+                    week,
                 ]
             )
 
@@ -1209,9 +1284,110 @@ def stats(sites: list[Site]) -> int:
     return 0
 
 
+# The crossover started on this Monday (ISO week 42). Snapshots measuring
+# earlier weeks used the old fixed split, or none, and must not be mixed in.
+EXPERIMENT_START = date(2026, 10, 12)
+
+
+def measured_week(snapshot: date) -> int | None:
+    """The ISO week a snapshot's weekly counters describe, or None to ignore it.
+
+    Only Monday snapshots count: Wallapop's figure is "Estadísticas de la
+    semana", so Monday's reading covers the week that just ended. Other days
+    straddle two treatment weeks and would blur bumped into control.
+    """
+    if snapshot.weekday() != 0:
+        return None
+    week_start = snapshot - timedelta(days=7)
+    if week_start < EXPERIMENT_START:
+        return None
+    return week_start.isocalendar().week
+
+
+def paired_diffs(observations: list[tuple[str, int, int]]) -> dict[str, float]:
+    """Per listing: mean views in bumped weeks minus mean in control weeks.
+
+    Takes (item_id, week, views). A listing seen only in one arm — sold early,
+    listed late — has nothing to be compared with and is left out.
+    """
+    arms: dict[str, dict[str, list[int]]] = {}
+    for item_id, week, views in observations:
+        group = group_for(item_id, week)
+        arms.setdefault(item_id, {BUMP: [], CONTROL: []})[group].append(views)
+    return {
+        item_id: sum(a[BUMP]) / len(a[BUMP]) - sum(a[CONTROL]) / len(a[CONTROL])
+        for item_id, a in arms.items()
+        if a[BUMP] and a[CONTROL]
+    }
+
+
+def sign_flip_p(diffs: list[float]) -> float:
+    """Two-sided exact p-value that the mean diff is zero.
+
+    Under "the bump does nothing" each listing's diff is as likely to be
+    negative as positive, so every sign pattern is equally likely; the p-value
+    is the share of patterns whose mean is at least as extreme as observed.
+    """
+    # ponytail: exact 2^n enumeration, fine to n≈20; sample patterns beyond that.
+    if not diffs:
+        return 1.0
+    observed = abs(sum(diffs))
+    patterns = list(itertools.product((1, -1), repeat=len(diffs)))
+    extreme = sum(
+        1
+        for signs in patterns
+        if abs(sum(s * d for s, d in zip(signs, diffs))) >= observed - 1e-9
+    )
+    return extreme / len(patterns)
+
+
+def analyze() -> int:
+    """Read the stats CSVs and report whether bumped weeks beat control weeks."""
+    observations: list[tuple[str, int, int]] = []
+    latest: dict[int, Path] = {}
+    if STATS_DIR.exists():
+        for path in sorted(STATS_DIR.glob("*.csv")):
+            try:
+                taken = date.fromisoformat(path.stem[:10])  # 2026-10-19-2000.csv
+            except ValueError:
+                continue
+            week = measured_week(taken)
+            if week is not None:
+                latest[week] = path  # sorted, so the last one of a Monday wins
+    for week, path in sorted(latest.items()):
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                views = row.get("views", "")
+                if row.get("item_id") and views.isdigit():
+                    observations.append((row["item_id"], week, int(views)))
+
+    diffs = paired_diffs(observations)
+    if not diffs:
+        log.error(
+            "No listing has both a bumped and a control week yet. Needs Monday "
+            "snapshots from %s on, covering at least two weeks (found %d).",
+            EXPERIMENT_START,
+            len(latest),
+        )
+        return 1
+
+    for item_id, diff in sorted(diffs.items(), key=lambda kv: kv[1]):
+        print(f"{diff:+8.1f}  {item_id}")
+    effect = sum(diffs.values()) / len(diffs)
+    p = sign_flip_p(list(diffs.values()))
+    print(
+        f"\nWeeks: {', '.join(str(w) for w in sorted(latest))}  "
+        f"Listings: {len(diffs)}\n"
+        f"Mean views per week, bumped minus control: {effect:+.1f}  (p = {p:.3f})"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "login", "probe", "status", "stats"])
+    parser.add_argument(
+        "command", choices=["run", "login", "probe", "status", "stats", "analyze"]
+    )
     parser.add_argument(
         "--publish",
         action="store_true",
@@ -1254,6 +1430,8 @@ def main(argv: list[str] | None = None) -> int:
         return status(chosen)
     if args.command == "stats":
         return stats(chosen)
+    if args.command == "analyze":
+        return analyze()
 
     log.info(
         "Starting run (sites=%s, publish=%s, limit=%s, experiment=%s)",

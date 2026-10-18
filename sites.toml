@@ -5,7 +5,8 @@
 # fix the values below against that dump rather than touching bump.py.
 #
 #   catalog_url           page listing everything you have for sale
-#   edit_url              edit form for one listing; must contain {item_id}
+#   edit_url              edit form for one listing; must contain {item_id},
+#                         or "" to always click the edit control on the item page
 #   link_pattern          substring that marks an anchor as a listing link
 #   id_regex              one capture group pulling the listing id out of that href
 #   card_selector         ancestor of the link holding the listing's badges
@@ -17,7 +18,8 @@
 
 [wallapop]
 catalog_url = "https://es.wallapop.com/app/catalog/published"
-edit_url = "https://es.wallapop.com/app/catalog/edit/{item_id}"
+# Since 2026-10 the edit form lives at an opaque id the listing URL does not carry.
+edit_url = ""
 link_pattern = "/item/"
 id_regex = "/item/([^/?#]+)"
 card_selector = "article, li, [class*=\"card\" i]"
