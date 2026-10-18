@@ -408,9 +408,70 @@ def test_stats_agent_runs_daily_clear_of_the_bump_nights() -> None:
     # start at 22:25 and collide with one.
     plist = plistlib.loads(Path("com.enrigle.wallabump.stats.plist").read_bytes())
     assert "stats" in plist["ProgramArguments"]
-    entry = plist["StartCalendarInterval"]
-    assert "Weekday" not in entry
-    assert (entry["Hour"], entry["Minute"]) == (20, 0)
+    entries = plist["StartCalendarInterval"]
+    daily = [e for e in entries if "Weekday" not in e]
+    assert [(e["Hour"], e["Minute"]) for e in daily] == [(20, 0)]
+    # Monday's snapshot is the one analyze uses; a noon backup covers a
+    # missed or failed 20:00.
+    assert {"Weekday": 1, "Hour": 12, "Minute": 0} in entries
+    assert all(e["Hour"] != 22 for e in entries)
+
+
+ROW = {"href": "/item/mesa-1", "title": "Mesa", "counters": ["12", "0", "1"]}
+
+
+class FakeStatsRead:
+    """Stands in for read_stats_page: returns each outcome, or raises it."""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self.outcomes = list(outcomes)
+
+    def __call__(self) -> object:
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def stats_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcomes: list[object]
+) -> list[float]:
+    sleeps: list[float] = []
+    monkeypatch.setattr(bump, "STATS_DIR", tmp_path)
+    monkeypatch.setattr(bump, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(bump.time, "sleep", sleeps.append)
+    monkeypatch.setattr(bump, "read_stats_page", FakeStatsRead(outcomes))
+    return sleeps
+
+
+def test_stats_retries_until_the_page_loads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sleeps = stats_env(
+        monkeypatch, tmp_path, [bump.PlaywrightTimeout("goto"), [], [ROW]]
+    )
+    assert bump.stats(list(load_sites().values())) == 0
+    assert len(sleeps) == 2
+    assert len(list(tmp_path.glob("*.csv"))) == 1
+
+
+def test_stats_gives_up_after_the_last_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sleeps = stats_env(monkeypatch, tmp_path, [[], [], []])
+    assert bump.stats(list(load_sites().values())) == 1
+    assert len(sleeps) == bump.STATS_ATTEMPTS - 1
+    assert list(tmp_path.glob("*.csv")) == []
+
+
+def test_stats_does_not_retry_when_signed_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A login page will not fix itself in two minutes; retrying only delays
+    # the RE-AUTH message.
+    sleeps = stats_env(monkeypatch, tmp_path, [None])
+    assert bump.stats(list(load_sites().values())) == 1
+    assert sleeps == []
 
 
 # --- Chrome lifecycle ---------------------------------------------------------

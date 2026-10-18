@@ -22,10 +22,19 @@
          Kept well clear of the 22:25 bump runs, which use the same Chrome
          profile. Unload once the experiment has its answer. -->
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key><integer>20</integer>
-        <key>Minute</key><integer>0</integer>
-    </dict>
+    <array>
+        <dict>
+            <key>Hour</key><integer>20</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <!-- Monday noon backup: Monday's snapshot is the one analyze uses.
+             A later Monday file replaces it, so a working 20:00 still wins. -->
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>12</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+    </array>
 
     <key>RunAtLoad</key>
     <false/>

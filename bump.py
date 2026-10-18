@@ -57,6 +57,7 @@ from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 import tomllib
 from playwright.sync_api import (
@@ -1156,6 +1157,41 @@ def probe(sites: list[Site]) -> int:
     return 0
 
 
+STATS_ATTEMPTS = 3
+STATS_RETRY_SECONDS = 120
+
+
+def read_stats_page() -> list[dict[str, Any]] | None:
+    """One attempt at reading the stats page.
+
+    Returns None when signed out, [] when no rows rendered. Raises on browser
+    errors and timeouts; the caller decides whether to try again.
+    """
+    with owned_chrome(STATS_URL), sync_playwright() as playwright:
+        browser = attach(playwright, STATS_URL)
+        page = browser.contexts[0].new_page()
+        try:
+            page.goto(STATS_URL, wait_until="domcontentloaded", timeout=60000)
+            if "auth" in page.url or "login" in page.url:
+                return None
+            page.wait_for_selector("tsl-item-stats-row", timeout=30000)
+            # The list renders lazily; scroll until the row count stops growing.
+            seen = -1
+            for _ in range(15):
+                found = page.locator("tsl-item-stats-row").count()
+                if found == seen:
+                    break
+                seen = found
+                page.mouse.wheel(0, 5000)
+                page.wait_for_timeout(800)
+            if "auth" in page.url or "login" in page.url:
+                return None
+            rows: list[dict[str, Any]] = page.evaluate(_STATS_JS)
+            return rows
+        finally:
+            page.close()
+
+
 def stats(sites: list[Site]) -> int:
     """Snapshot each listing's views, chats and favourites to a CSV.
 
@@ -1173,31 +1209,32 @@ def stats(sites: list[Site]) -> int:
     ensure_dirs()
     STATS_DIR.mkdir(parents=True, exist_ok=True)
 
-    with owned_chrome(STATS_URL), sync_playwright() as playwright:
-        browser = attach(playwright, STATS_URL)
-        page = browser.contexts[0].new_page()
+    # The stats page often times out or renders empty on the first try; a
+    # missed Monday snapshot loses a whole experiment week, so try again.
+    # Each attempt opens and closes its own Chrome, which also clears a
+    # frozen tab.
+    raw: list[dict[str, Any]] | None = []
+    for attempt in range(1, STATS_ATTEMPTS + 1):
         try:
-            page.goto(STATS_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(5000)
-            # The list renders lazily; scroll until the row count stops growing.
-            seen = -1
-            for _ in range(15):
-                found = page.locator("tsl-item-stats-row").count()
-                if found == seen:
-                    break
-                seen = found
-                page.mouse.wheel(0, 5000)
-                page.wait_for_timeout(800)
-            if "auth" in page.url or "login" in page.url:
-                log.error("RE-AUTH NEEDED — run: python bump.py login")
-                return 1
-            raw = page.evaluate(_STATS_JS)
-        finally:
-            page.close()
+            raw = read_stats_page()
+        except (PlaywrightError, PlaywrightTimeout, RuntimeError) as exc:
+            log.warning("stats attempt %d/%d failed: %s", attempt, STATS_ATTEMPTS, exc)
+            raw = []
+        if raw is None:
+            log.error("RE-AUTH NEEDED — run: python bump.py login")
+            return 1
+        if raw:
+            break
+        if attempt < STATS_ATTEMPTS:
+            log.info("No stats rows yet; retrying in %ds.", STATS_RETRY_SECONDS)
+            time.sleep(STATS_RETRY_SECONDS)
 
     if not raw:
         log.error(
-            "No listings found on %s — stale selector or page not loaded.", STATS_URL
+            "No listings found on %s after %d attempts — stale selector or page "
+            "not loaded.",
+            STATS_URL,
+            STATS_ATTEMPTS,
         )
         return 1
 
