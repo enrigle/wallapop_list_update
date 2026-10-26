@@ -9,8 +9,12 @@ from pathlib import Path
 
 import pytest
 
-import bump
-from bump import (
+from wallabump import chrome, commands, logic
+from wallabump.chrome import (
+    page_targets_to_activate,
+    slept_seconds,
+)
+from wallabump.logic import (
     BUMP,
     CONTROL,
     MARKER,
@@ -22,14 +26,12 @@ from bump import (
     load_sites,
     measured_week,
     next_fire,
-    page_targets_to_activate,
     paired_diffs,
     parse_counter,
     plist_for,
     plist_name,
     schedule_entries,
     sign_flip_p,
-    slept_seconds,
     toggle,
 )
 
@@ -437,10 +439,10 @@ def stats_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcomes: list[object]
 ) -> list[float]:
     sleeps: list[float] = []
-    monkeypatch.setattr(bump, "STATS_DIR", tmp_path)
-    monkeypatch.setattr(bump, "ensure_dirs", lambda: None)
-    monkeypatch.setattr(bump.time, "sleep", sleeps.append)
-    monkeypatch.setattr(bump, "read_stats_page", FakeStatsRead(outcomes))
+    monkeypatch.setattr(commands, "STATS_DIR", tmp_path)
+    monkeypatch.setattr(commands, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(commands.time, "sleep", sleeps.append)
+    monkeypatch.setattr(commands, "read_stats_page", FakeStatsRead(outcomes))
     return sleeps
 
 
@@ -448,9 +450,9 @@ def test_stats_retries_until_the_page_loads(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     sleeps = stats_env(
-        monkeypatch, tmp_path, [bump.PlaywrightTimeout("goto"), [], [ROW]]
+        monkeypatch, tmp_path, [commands.PlaywrightTimeout("goto"), [], [ROW]]
     )
-    assert bump.stats(list(load_sites().values())) == 0
+    assert commands.stats(list(load_sites().values())) == 0
     assert len(sleeps) == 2
     assert len(list(tmp_path.glob("*.csv"))) == 1
 
@@ -459,8 +461,8 @@ def test_stats_gives_up_after_the_last_attempt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     sleeps = stats_env(monkeypatch, tmp_path, [[], [], []])
-    assert bump.stats(list(load_sites().values())) == 1
-    assert len(sleeps) == bump.STATS_ATTEMPTS - 1
+    assert commands.stats(list(load_sites().values())) == 1
+    assert len(sleeps) == commands.STATS_ATTEMPTS - 1
     assert list(tmp_path.glob("*.csv")) == []
 
 
@@ -470,7 +472,7 @@ def test_stats_does_not_retry_when_signed_out(
     # A login page will not fix itself in two minutes; retrying only delays
     # the RE-AUTH message.
     sleeps = stats_env(monkeypatch, tmp_path, [None])
-    assert bump.stats(list(load_sites().values())) == 1
+    assert commands.stats(list(load_sites().values())) == 1
     assert sleeps == []
 
 
@@ -482,9 +484,9 @@ def test_a_chrome_that_was_already_running_is_left_alone(
 ) -> None:
     # Someone else's browser: closing it would take their tabs with it.
     quit_calls: list[object] = []
-    monkeypatch.setattr(bump, "ensure_chrome", lambda url: None)
-    monkeypatch.setattr(bump, "quit_chrome", quit_calls.append)
-    with bump.owned_chrome("https://example.test"):
+    monkeypatch.setattr(chrome, "ensure_chrome", lambda url: None)
+    monkeypatch.setattr(chrome, "quit_chrome", quit_calls.append)
+    with chrome.owned_chrome("https://example.test"):
         pass
     assert quit_calls == []
 
@@ -495,9 +497,9 @@ def test_a_chrome_this_command_opened_is_closed(
     # Left running, it becomes the Dock's Chrome and the everyday browser.
     launched = object()
     quit_calls: list[object] = []
-    monkeypatch.setattr(bump, "ensure_chrome", lambda url: launched)
-    monkeypatch.setattr(bump, "quit_chrome", quit_calls.append)
-    with bump.owned_chrome("https://example.test"):
+    monkeypatch.setattr(chrome, "ensure_chrome", lambda url: launched)
+    monkeypatch.setattr(chrome, "quit_chrome", quit_calls.append)
+    with chrome.owned_chrome("https://example.test"):
         pass
     assert quit_calls == [launched]
 
@@ -507,9 +509,9 @@ def test_it_is_closed_even_when_the_command_fails(
 ) -> None:
     launched = object()
     quit_calls: list[object] = []
-    monkeypatch.setattr(bump, "ensure_chrome", lambda url: launched)
-    monkeypatch.setattr(bump, "quit_chrome", quit_calls.append)
-    with pytest.raises(RuntimeError), bump.owned_chrome("https://example.test"):
+    monkeypatch.setattr(chrome, "ensure_chrome", lambda url: launched)
+    monkeypatch.setattr(chrome, "quit_chrome", quit_calls.append)
+    with pytest.raises(RuntimeError), chrome.owned_chrome("https://example.test"):
         raise RuntimeError("run blew up")
     assert quit_calls == [launched]
 
@@ -672,7 +674,7 @@ def test_plist_for_prefers_the_installed_agent(
 ) -> None:
     installed = tmp_path / plist_name("vinted")
     installed.write_text("", encoding="utf-8")
-    monkeypatch.setattr(bump, "LAUNCH_AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(logic, "LAUNCH_AGENTS_DIR", tmp_path)
     assert plist_for("vinted") == installed
 
 
@@ -681,8 +683,8 @@ def test_plist_for_falls_back_to_the_repo_copy(
 ) -> None:
     # Nothing installed: status still has a schedule to show, and says it is
     # not installed rather than reporting no schedule at all.
-    monkeypatch.setattr(bump, "LAUNCH_AGENTS_DIR", tmp_path)
-    assert plist_for("vinted") == bump.REPO_DIR / plist_name("vinted")
+    monkeypatch.setattr(logic, "LAUNCH_AGENTS_DIR", tmp_path)
+    assert plist_for("vinted") == logic.REPO_DIR / plist_name("vinted")
 
 
 def test_schedule_entries_on_a_missing_file_is_empty() -> None:

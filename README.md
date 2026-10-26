@@ -222,7 +222,13 @@ Only the pure parts are tested — `toggle()`, `describe()`, the config layer, t
 
 | File | Holds |
 | --- | --- |
-| `bump.py` | Everything: constants, pure logic, then browser I/O. |
+| `bump.py` | Entry point shim. Same as `python -m wallabump`. |
+| `wallabump/__main__.py` | CLI and logging setup. |
+| `wallabump/logic.py` | Pure logic: the toggle, schedules, site config, experiment math. |
+| `wallabump/chrome.py` | The bot's Chrome: launch, close, thaw tabs, CDP attach. |
+| `wallabump/pages.py` | Page actions: find listings, edit one, read stats. |
+| `wallabump/report.py` | Run results and the receipt email. |
+| `wallabump/commands.py` | `run`, `login`, `status`, `probe`, `stats`, `analyze`. |
 | `sites.toml` | Per-site URLs and selectors. Edit when a site redesigns. |
 | `test_bump.py` | Edge cases for the pure functions. |
 | `com.enrigle.wallabump.<site>.plist` | One launchd agent per site. Copy to `~/Library/LaunchAgents/`. |
